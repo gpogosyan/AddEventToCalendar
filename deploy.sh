@@ -6,7 +6,8 @@
 #   VM_USER, VM_HOST, VM_PATH, SSH_KEY
 #
 # На VM каталог VM_PATH — рабочая копия; update.sh копирует код в /opt/addcalendrbot
-# и перезапускает сервис. Файл config.py на сервере не перезаписывается (исключён из rsync).
+# и перезапускает сервис. Секреты в .env не синхронизируются (исключены из rsync);
+# при необходимости: rsync .env отдельно или UPDATE_ENV=1 sudo ./update.sh на VM.
 
 set -euo pipefail
 
@@ -28,7 +29,6 @@ rsync -avz --delete \
     --exclude='__pycache__' \
     --exclude='*.pyc' \
     --exclude='.DS_Store' \
-    --exclude='config.py' \
     --exclude='*.db' \
     --exclude='.env' \
     --exclude='agent-transcripts' \
@@ -40,7 +40,7 @@ rsync -avz --delete \
     "${PROJECT_DIR}/" \
     "${VM_USER}@${VM_HOST}:${VM_PATH}"
 
-echo "==> Running update on VM (keeps /opt/addcalendrbot/config.py)"
+echo "==> Running update on VM (keeps /opt/addcalendrbot/.env unless UPDATE_ENV=1)"
 ssh ${SSH_OPTS} "${VM_USER}@${VM_HOST}" \
     "cd ${VM_PATH} && chmod +x update.sh 2>/dev/null || true && sudo ./update.sh"
 

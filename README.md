@@ -6,23 +6,27 @@
 - Извлечение параметров события с помощью LLM
 - Рассылка приглашений на email всем зарегистрированным в чате
 
+## Секреты (API-ключи) и Git
+
+**Не храните ключи в репозитории** — даже в приватном: история Git и форки легко раскрывают секреты. В GitHub нет «скрытых полей» для кода; для CI используются отдельные [encrypted secrets](https://docs.github.com/en/actions/security-guides/using-secrets-in-github-actions) (переменные для workflow, не для коммитов в файлы).
+
+В проекте:
+
+- **`config.py`** в git — только загрузка переменных из окружения и файла **`.env`** (без секретов в коде).
+- **`.env`** — ваши настоящие ключи, файл **в `.gitignore`**, создаётся один раз на машине.
+- **`.env.example`** — шаблон без значений, можно коммитить.
+
+Локально:
+
+```bash
+cp .env.example .env
+# отредактируйте .env
+```
+
 ## Локальный запуск (для разработки)
-1. Установите зависимости:
-   ```
-   pip install -r requirements.txt
-   ```
-2. Скопируйте пример и заполните `config.py` своими данными:
-   ```
-   cp config.example.py config.py
-   ```
-   Поля в `config.py`:
-   - TELEGRAM_TOKEN — токен Telegram-бота
-   - OPENAI_API_KEY — ключ OpenAI
-   - EMAIL_LOGIN, EMAIL_PASSWORD — email и пароль для отправки писем
-3. Запустите бота:
-   ```
-   python bot.py
-   ```
+1. Установите зависимости: `pip install -r requirements.txt`
+2. Создайте `.env` (см. выше). Переменные: `TELEGRAM_TOKEN`, `OPENAI_API_KEY`, `EMAIL_LOGIN`, `EMAIL_PASSWORD`; при необходимости `SMTP_SERVER`, `SMTP_PORT`.
+3. Запуск: `python bot.py`
 
 ## Развертывание на Google Cloud VM (production)
 
@@ -34,29 +38,30 @@
 **Первый раз на новой VM** (пока нет `/opt/addcalendrbot/venv`):
 
 1. Синхронизируйте код: `chmod +x deploy.sh && ./deploy.sh` — rsync пройдёт, `update.sh` напомнит про bootstrap.
-2. По SSH на VM: `cd ~/addcalendrbot`, создайте `config.py` (реальные токены), например `cp config.example.py config.py` и отредактируйте.
-3. Выполните: `sudo ./bootstrap-vm.sh` — создаст пользователя сервиса, venv, systemd и запустит бота.
+2. По SSH: `cd ~/addcalendrbot`, создайте **`cp .env.example .env`** и заполните секреты.
+3. `sudo ./bootstrap-vm.sh` — пользователь сервиса, venv, копирование `.env` в `/opt/addcalendrbot/.env`, systemd, запуск.
 
-Дальше достаточно `./deploy.sh` с ноутбука.
+Дальше с ноутбука: **`./deploy.sh`** (код обновится, **`/opt/.../.env` не трогается**).
+
+Чтобы **обновить секреты** с ноутбука: скопируйте `.env` в `~/addcalendrbot/`, затем на VM:
+
+```bash
+cd ~/addcalendrbot && sudo UPDATE_ENV=1 ./update.sh
+```
+
+Или вручную: `sudo nano /opt/addcalendrbot/.env` и `sudo systemctl restart addcalendrbot`.
 
 ```bash
 chmod +x deploy.sh
 ./deploy.sh
 ```
 
-Скрипт синхронизирует проект в `~/addcalendrbot/` на VM и выполняет `sudo ./update.sh`.  
-**`config.py` и файлы `*.db` в rsync не входят** — продакшен-секреты в `/opt/addcalendrbot/` не затираются.
-
-Чтобы один раз обновить `config.py` с диска на VM, на сервере в каталоге с копией проекта:
-
-```bash
-sudo UPDATE_CONFIG=1 ./update.sh
-```
+Rsync **не включает** `.env` и `*.db`, чтобы не затереть продакшен.
 
 ### Автодеплой из GitHub Actions
 
-В репозитории на GitHub добавьте secrets (те же имена, что у DarionPass: `VM_HOST`, `VM_USER`, `VM_SSH_PRIVATE_KEY`) и **`VM_DEPLOY_PATH`** = `/home/gregorypogosyan/addcalendrbot/` (путь к каталогу синхронизации на VM).  
-При пуше в `main` сработает workflow `.github/workflows/deploy.yml`.
+Secrets для SSH: `VM_HOST`, `VM_USER`, `VM_SSH_PRIVATE_KEY`, `VM_DEPLOY_PATH` (как у DarionPass).  
+Workflow обновляет только код из git; **файл `.env` на сервере нужно создать вручную один раз** (или дописать шаг, который собирает env из GitHub Secrets — отдельная настройка).
 
 ### Подготовка виртуальной машины
 1. Создайте виртуальную машину в Google Cloud (например, Ubuntu 22.04 LTS)

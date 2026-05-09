@@ -5,7 +5,8 @@
 #   VM_DEPLOY_PATH       — абсолютный путь, например /home/gregorypogosyan/addcalendrbot/
 #   VM_SSH_PRIVATE_KEY   — содержимое ~/.ssh/darionpass_gcp (-----BEGIN …)
 #
-# config.py и *.db на сервере не перезаписываются rsync (см. deploy.sh).
+# Файл .env с секретами на сервере не в репозитории и исключён из rsync.
+# Один раз создайте .env на VM вручную (см. README).
 
 name: Deploy to VM
 
@@ -46,7 +47,6 @@ jobs:
             --exclude='__pycache__'
             --exclude='*.pyc'
             --exclude='.DS_Store'
-            --exclude='config.py'
             --exclude='*.db'
             --exclude='.env'
             --exclude='agent-transcripts'

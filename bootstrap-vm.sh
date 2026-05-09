@@ -1,7 +1,7 @@
 #!/bin/bash
 # Одноразовая полная установка на VM в /opt/addcalendrbot (запуск на сервере с sudo).
-# Перед запуском положите реальный config.py в этот каталог (рядом с bot.py):
-#   cd ~/addcalendrbot && cp config.example.py config.py && nano config.py
+# Перед запуском создайте .env (секреты не в git):
+#   cd ~/addcalendrbot && cp .env.example .env && nano .env
 # Затем:
 #   sudo ./bootstrap-vm.sh
 
@@ -19,8 +19,8 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-if [ ! -f config.py ]; then
-    echo "ОШИБКА: нет config.py в $(pwd). Создайте из примера: cp config.example.py config.py"
+if [ ! -f .env ]; then
+    echo "ОШИБКА: нет .env в $(pwd). Создайте: cp .env.example .env и заполните ключи"
     exit 1
 fi
 
@@ -36,6 +36,8 @@ mkdir -p "$BOT_DIR"
 
 echo "Копирование файлов..."
 cp bot.py config.py requirements.txt "$BOT_DIR/"
+cp .env "$BOT_DIR/.env"
+chmod 600 "$BOT_DIR/.env"
 if [ -f "users.db" ]; then
     cp users.db "$BOT_DIR/"
 fi
@@ -43,6 +45,7 @@ fi
 echo "Установка прав доступа..."
 chown -R "$BOT_USER:$BOT_USER" "$BOT_DIR"
 chmod +x "$BOT_DIR/bot.py"
+chmod 600 "$BOT_DIR/.env"
 
 echo "Создание виртуального окружения Python..."
 if command -v python3 &> /dev/null; then

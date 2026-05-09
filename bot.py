@@ -11,11 +11,25 @@ import openai
 import config
 import datetime
 import uuid
-import easyocr
 import re
+import threading
 import warnings
 warnings.filterwarnings("ignore", message="'pin_memory' argument is set as true but not supported on MPS now")
 warnings.filterwarnings("ignore", message="Using CPU. Note: This module is much faster with a GPU.")
+
+_easyocr_reader = None
+_easyocr_lock = threading.Lock()
+
+def _get_easyocr_reader():
+    """EasyOCR и модели подгружаются только при первой попытке OCR по фото."""
+    global _easyocr_reader
+    if _easyocr_reader is not None:
+        return _easyocr_reader
+    with _easyocr_lock:
+        if _easyocr_reader is None:
+            import easyocr
+            _easyocr_reader = easyocr.Reader(['ru', 'en'], gpu=False)
+    return _easyocr_reader
 
 # Настройка логирования
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -230,7 +244,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo_path = f"photo_{chat_id}.jpg"
     await photo_file.download_to_drive(photo_path)
     try:
-        reader = easyocr.Reader(['ru', 'en'], gpu=False)
+        reader = _get_easyocr_reader()
         ocr_result = reader.readtext(photo_path, detail=0, paragraph=True)
         text = '\n'.join(ocr_result)
     #    await update.message.reply_text(f'Текст, извлечённый из изображения:\n{text}\n\nОтправляю в LLM для извлечения параметров события...')

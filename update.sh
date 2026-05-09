@@ -18,7 +18,7 @@ fi
 
 if [ ! -d "$VENV_DIR" ]; then
     echo "ОШИБКА: ${VENV_DIR} не найден. Один раз на VM из ~/addcalendrbot:"
-    echo "  cp config.example.py config.py   # затем заполните секреты"
+    echo "  cp .env.example .env && nano .env"
     echo "  sudo ./bootstrap-vm.sh"
     exit 1
 fi
@@ -29,12 +29,13 @@ systemctl stop addcalendrbot.service
 
 # Копирование обновленных файлов
 echo "Копирование обновленных файлов..."
-cp bot.py requirements.txt "$BOT_DIR/"
-if [ "${UPDATE_CONFIG:-0}" = "1" ] && [ -f config.py ]; then
-    echo "UPDATE_CONFIG=1 — копирую config.py на сервер"
-    cp config.py "$BOT_DIR/"
-elif [ "${UPDATE_CONFIG:-0}" = "1" ] && [ ! -f config.py ]; then
-    echo "ПРЕДУПРЕЖДЕНИЕ: UPDATE_CONFIG=1, но config.py нет в текущем каталоге — пропускаю"
+cp bot.py config.py requirements.txt "$BOT_DIR/"
+if [ "${UPDATE_ENV:-0}" = "1" ] && [ -f .env ]; then
+    echo "UPDATE_ENV=1 — обновляю .env в ${BOT_DIR}"
+    cp .env "$BOT_DIR/.env"
+    chmod 600 "$BOT_DIR/.env"
+elif [ "${UPDATE_ENV:-0}" = "1" ] && [ ! -f .env ]; then
+    echo "ПРЕДУПРЕЖДЕНИЕ: UPDATE_ENV=1, но .env нет в текущем каталоге — пропускаю"
 fi
 if [ -f addcalendrbot.service ]; then
     echo "Обновление unit-файла systemd..."
@@ -43,6 +44,9 @@ fi
 
 # Установка прав доступа
 chown -R "$BOT_USER:$BOT_USER" "$BOT_DIR"
+if [ -f "$BOT_DIR/.env" ]; then
+    chmod 600 "$BOT_DIR/.env"
+fi
 
 # Обновление зависимостей в venv
 echo "Обновление зависимостей Python..."
