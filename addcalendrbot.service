@@ -1,0 +1,19 @@
+[Unit]
+Description=AddCalendar Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=addcalendrbot
+WorkingDirectory=/opt/addcalendrbot
+Environment="PATH=/usr/bin:/usr/local/bin"
+ExecStart=/opt/addcalendrbot/venv/bin/python3 /opt/addcalendrbot/bot.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=addcalendrbot
+
+[Install]
+WantedBy=multi-user.target
+
