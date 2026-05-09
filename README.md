@@ -11,7 +11,11 @@
    ```
    pip install -r requirements.txt
    ```
-2. Заполните `config.py` своими данными:
+2. Скопируйте пример и заполните `config.py` своими данными:
+   ```
+   cp config.example.py config.py
+   ```
+   Поля в `config.py`:
    - TELEGRAM_TOKEN — токен Telegram-бота
    - OPENAI_API_KEY — ключ OpenAI
    - EMAIL_LOGIN, EMAIL_PASSWORD — email и пароль для отправки писем
@@ -21,6 +25,38 @@
    ```
 
 ## Развертывание на Google Cloud VM (production)
+
+### Быстрый деплой с ноутбука (та же VM и SSH-ключ, что у DarionPass)
+
+На машине должен быть ключ `~/.ssh/darionpass_gcp` (или задайте `SSH_KEY`).  
+Параметры по умолчанию: `gregorypogosyan@34.41.134.183`, каталог на VM `~/addcalendrbot/`.
+
+**Первый раз на новой VM** (пока нет `/opt/addcalendrbot/venv`):
+
+1. Синхронизируйте код: `chmod +x deploy.sh && ./deploy.sh` — rsync пройдёт, `update.sh` напомнит про bootstrap.
+2. По SSH на VM: `cd ~/addcalendrbot`, создайте `config.py` (реальные токены), например `cp config.example.py config.py` и отредактируйте.
+3. Выполните: `sudo ./bootstrap-vm.sh` — создаст пользователя сервиса, venv, systemd и запустит бота.
+
+Дальше достаточно `./deploy.sh` с ноутбука.
+
+```bash
+chmod +x deploy.sh
+./deploy.sh
+```
+
+Скрипт синхронизирует проект в `~/addcalendrbot/` на VM и выполняет `sudo ./update.sh`.  
+**`config.py` и файлы `*.db` в rsync не входят** — продакшен-секреты в `/opt/addcalendrbot/` не затираются.
+
+Чтобы один раз обновить `config.py` с диска на VM, на сервере в каталоге с копией проекта:
+
+```bash
+sudo UPDATE_CONFIG=1 ./update.sh
+```
+
+### Автодеплой из GitHub Actions
+
+В репозитории на GitHub добавьте secrets (те же имена, что у DarionPass: `VM_HOST`, `VM_USER`, `VM_SSH_PRIVATE_KEY`) и **`VM_DEPLOY_PATH`** = `/home/gregorypogosyan/addcalendrbot/` (путь к каталогу синхронизации на VM).  
+При пуше в `main` сработает workflow `.github/workflows/deploy.yml`.
 
 ### Подготовка виртуальной машины
 1. Создайте виртуальную машину в Google Cloud (например, Ubuntu 22.04 LTS)

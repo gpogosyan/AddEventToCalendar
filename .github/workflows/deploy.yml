@@ -1,0 +1,68 @@
+# Деплой на ту же GCP VM, что и DarionPass (rsync по SSH + sudo update.sh).
+# В репозитории GitHub: Settings → Secrets and variables → Actions:
+#   VM_HOST              — например 34.41.134.183
+#   VM_USER              — например gregorypogosyan
+#   VM_DEPLOY_PATH       — абсолютный путь, например /home/gregorypogosyan/addcalendrbot/
+#   VM_SSH_PRIVATE_KEY   — содержимое ~/.ssh/darionpass_gcp (-----BEGIN …)
+#
+# config.py и *.db на сервере не перезаписываются rsync (см. deploy.sh).
+
+name: Deploy to VM
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare SSH
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+          VM_SSH_PRIVATE_KEY: ${{ secrets.VM_SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$VM_SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$VM_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Rsync and update service
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+          VM_DEPLOY_PATH: ${{ secrets.VM_DEPLOY_PATH }}
+        run: |
+          RSYNC_EXCLUDES=(
+            --exclude='.git'
+            --exclude='.github'
+            --exclude='.venv'
+            --exclude='venv'
+            --exclude='__pycache__'
+            --exclude='*.pyc'
+            --exclude='.DS_Store'
+            --exclude='config.py'
+            --exclude='*.db'
+            --exclude='.env'
+            --exclude='agent-transcripts'
+            --exclude='terminals'
+            --exclude='deploy.sh'
+            --exclude='photo_*.jpg'
+            --exclude='photo_*.png'
+          )
+          rsync -avz --delete "${RSYNC_EXCLUDES[@]}" \
+            -e "ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" \
+            ./ "${VM_USER}@${VM_HOST}:${VM_DEPLOY_PATH}"
+
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
+            "${VM_USER}@${VM_HOST}" \
+            "cd ${VM_DEPLOY_PATH} && chmod +x update.sh && sudo ./update.sh"
+
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
+            "${VM_USER}@${VM_HOST}" \
+            "sudo systemctl --no-pager status addcalendrbot || true"

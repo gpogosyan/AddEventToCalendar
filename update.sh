@@ -16,13 +16,30 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
+if [ ! -d "$VENV_DIR" ]; then
+    echo "ОШИБКА: ${VENV_DIR} не найден. Один раз на VM из ~/addcalendrbot:"
+    echo "  cp config.example.py config.py   # затем заполните секреты"
+    echo "  sudo ./bootstrap-vm.sh"
+    exit 1
+fi
+
 # Остановка сервиса
 echo "Остановка бота..."
 systemctl stop addcalendrbot.service
 
 # Копирование обновленных файлов
 echo "Копирование обновленных файлов..."
-cp bot.py config.py requirements.txt "$BOT_DIR/"
+cp bot.py requirements.txt "$BOT_DIR/"
+if [ "${UPDATE_CONFIG:-0}" = "1" ] && [ -f config.py ]; then
+    echo "UPDATE_CONFIG=1 — копирую config.py на сервер"
+    cp config.py "$BOT_DIR/"
+elif [ "${UPDATE_CONFIG:-0}" = "1" ] && [ ! -f config.py ]; then
+    echo "ПРЕДУПРЕЖДЕНИЕ: UPDATE_CONFIG=1, но config.py нет в текущем каталоге — пропускаю"
+fi
+if [ -f addcalendrbot.service ]; then
+    echo "Обновление unit-файла systemd..."
+    cp addcalendrbot.service /etc/systemd/system/
+fi
 
 # Установка прав доступа
 chown -R "$BOT_USER:$BOT_USER" "$BOT_DIR"
