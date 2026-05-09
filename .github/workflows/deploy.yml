@@ -1,16 +1,13 @@
 # Деплой на GCP VM: rsync кода + запись /opt/addcalendrbot/.env из GitHub Actions Secrets + update.sh
 #
-# Settings → Secrets and variables → Actions:
+# Settings → Secrets and variables → Actions → Repository secrets:
 #
-# SSH / путь:
+# SSH:
 #   VM_HOST, VM_USER, VM_DEPLOY_PATH, VM_SSH_PRIVATE_KEY
 #
-# Секреты приложения (обязательные):
+# Приложение:
 #   TELEGRAM_TOKEN, OPENAI_API_KEY, EMAIL_LOGIN, EMAIL_PASSWORD
-#
-# Опционально:
-#   SMTP_SERVER   (по умолчанию smtp.gmail.com)
-#   SMTP_PORT     (по умолчанию 465)
+# Опционально: SMTP_SERVER, SMTP_PORT
 
 name: Deploy to VM
 
@@ -26,33 +23,33 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare SSH
-        env:
-          VM_HOST: ${{ secrets.VM_HOST }}
-          VM_USER: ${{ secrets.VM_USER }}
-          VM_SSH_PRIVATE_KEY: ${{ secrets.VM_SSH_PRIVATE_KEY }}
-        run: |
-          mkdir -p ~/.ssh
-          printf '%s\n' "$VM_SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H "$VM_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
-
-      - name: Rsync, push .env from Secrets, restart service
+      - name: Prepare SSH and verify connection
         env:
           VM_HOST: ${{ secrets.VM_HOST }}
           VM_USER: ${{ secrets.VM_USER }}
           VM_DEPLOY_PATH: ${{ secrets.VM_DEPLOY_PATH }}
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          EMAIL_LOGIN: ${{ secrets.EMAIL_LOGIN }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          VM_SSH_PRIVATE_KEY: ${{ secrets.VM_SSH_PRIVATE_KEY }}
         run: |
           set -euo pipefail
-          SSH=(ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new)
-          SCP=(scp -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new)
+          : "${VM_HOST:?VM_HOST secret is empty}"
+          : "${VM_USER:?VM_USER secret is empty}"
+          : "${VM_DEPLOY_PATH:?VM_DEPLOY_PATH secret is empty}"
+          : "${VM_SSH_PRIVATE_KEY:?VM_SSH_PRIVATE_KEY secret is empty}"
+          mkdir -p ~/.ssh
+          printf '%s\n' "$VM_SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$VM_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
+            -o BatchMode=yes -o ConnectTimeout=15 \
+            "${VM_USER}@${VM_HOST}" "echo 'SSH OK'"
 
+      - name: Rsync codebase to VM
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+          VM_DEPLOY_PATH: ${{ secrets.VM_DEPLOY_PATH }}
+        run: |
+          set -euo pipefail
           RSYNC_EXCLUDES=(
             --exclude='.git'
             --exclude='.github'
@@ -73,6 +70,24 @@ jobs:
             -e "ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" \
             ./ "${VM_USER}@${VM_HOST}:${VM_DEPLOY_PATH}"
 
+      - name: Push .env from Secrets to /opt and run update.sh
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+          VM_DEPLOY_PATH: ${{ secrets.VM_DEPLOY_PATH }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          EMAIL_LOGIN: ${{ secrets.EMAIL_LOGIN }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${TELEGRAM_TOKEN:?TELEGRAM_TOKEN secret is empty}"
+          : "${OPENAI_API_KEY:?OPENAI_API_KEY secret is empty}"
+          : "${EMAIL_LOGIN:?EMAIL_LOGIN secret is empty}"
+          : "${EMAIL_PASSWORD:?EMAIL_PASSWORD secret is empty}"
+
           python3 << 'PY' > .env.remote
           import os
           import shlex
@@ -81,7 +96,7 @@ jobs:
           def req(name: str) -> str:
               v = (os.environ.get(name) or "").strip()
               if not v:
-                  print(f"Error: GitHub Actions secret {name!r} is not set", file=sys.stderr)
+                  print(f"Error: missing {name}", file=sys.stderr)
                   sys.exit(1)
               return v
 
@@ -101,11 +116,19 @@ jobs:
           PY
 
           chmod 600 .env.remote
-          "${SCP[@]}" .env.remote "${VM_USER}@${VM_HOST}:/tmp/addcalendrbot.env"
+          scp -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
+            .env.remote "${VM_USER}@${VM_HOST}:/tmp/addcalendrbot.env"
           rm -f .env.remote
 
-          "${SSH[@]}" "${VM_USER}@${VM_HOST}" \
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
+            "${VM_USER}@${VM_HOST}" \
             "sudo mkdir -p /opt/addcalendrbot && sudo install -m 600 -o addcalendrbot -g addcalendrbot /tmp/addcalendrbot.env /opt/addcalendrbot/.env && rm -f /tmp/addcalendrbot.env && cd \"${VM_DEPLOY_PATH}\" && chmod +x update.sh && sudo ./update.sh"
 
-          "${SSH[@]}" "${VM_USER}@${VM_HOST}" \
+      - name: Service status
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
+            "${VM_USER}@${VM_HOST}" \
             "sudo systemctl --no-pager status addcalendrbot || true"
