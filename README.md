@@ -41,15 +41,9 @@ cp .env.example .env
 2. По SSH: `cd ~/addcalendrbot`, создайте **`cp .env.example .env`** и заполните секреты.
 3. `sudo ./bootstrap-vm.sh` — пользователь сервиса, venv, копирование `.env` в `/opt/addcalendrbot/.env`, systemd, запуск.
 
-Дальше с ноутбука: **`./deploy.sh`** (код обновится, **`/opt/.../.env` не трогается**).
+Дальше с ноутбука: **`./deploy.sh`** обновляет только код в `/opt` (секреты на сервере не меняет). Чтобы прод-конфиг всегда совпадал с **GitHub Secrets**, деплойте через **Actions** (push в `main`).
 
-Чтобы **обновить секреты** с ноутбука: скопируйте `.env` в `~/addcalendrbot/`, затем на VM:
-
-```bash
-cd ~/addcalendrbot && sudo UPDATE_ENV=1 ./update.sh
-```
-
-Или вручную: `sudo nano /opt/addcalendrbot/.env` и `sudo systemctl restart addcalendrbot`.
+Альтернатива без Actions: скопировать `.env` в `~/addcalendrbot/` и `sudo UPDATE_ENV=1 ./update.sh` на VM.
 
 ```bash
 chmod +x deploy.sh
@@ -82,9 +76,11 @@ Rsync **не включает** `.env` и `*.db`, чтобы не затерет
 | `SMTP_SERVER` | нет (по умолчанию `smtp.gmail.com`) |
 | `SMTP_PORT` | нет (по умолчанию `465`) |
 
-При каждом пуше в `main` (или запуске workflow вручную) выполняются: rsync кода → запись `.env` из Secrets → `sudo ./update.sh` → перезапуск сервиса.
+При каждом пуше в `main` (или запуске workflow вручную) выполняются: rsync кода → **сборка `/opt/addcalendrbot/.env` только из GitHub Secrets** → `sudo ./update.sh` → перезапуск сервиса. Руками править `.env` на сервере для этого сценария не нужно: меняете значения в **Settings → Secrets**, делаете push или **Run workflow** — файл на VM перезаписывается.
 
-Первая установка на **новой** VM по-прежнему требует одного раза **`sudo ./bootstrap-vm.sh`** (venv и systemd). После этого деплой полностью из GitHub.
+Локальный файл **`.env`** на ноутбуке нужен только для **`python bot.py`** и для **`./deploy.sh`** (ручной деплой **не** подтягивает секреты из GitHub — он не трогает `/opt/.../.env`, если не делать `UPDATE_ENV=1`).
+
+Первая установка на **новой** VM по-прежнему требует одного раза **`sudo ./bootstrap-vm.sh`** (venv и systemd). После этого прод можно вести только через Actions.
 
 #### Если workflow падает на шаге «Prepare SSH and verify connection»
 
