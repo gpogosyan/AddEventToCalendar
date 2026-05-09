@@ -105,7 +105,7 @@ jobs:
           rm -f .env.remote
 
           "${SSH[@]}" "${VM_USER}@${VM_HOST}" \
-            "sudo install -m 600 -o addcalendrbot -g addcalendrbot /tmp/addcalendrbot.env /opt/addcalendrbot/.env && rm -f /tmp/addcalendrbot.env && cd ${VM_DEPLOY_PATH} && chmod +x update.sh && sudo ./update.sh"
+            "sudo mkdir -p /opt/addcalendrbot && sudo install -m 600 -o addcalendrbot -g addcalendrbot /tmp/addcalendrbot.env /opt/addcalendrbot/.env && rm -f /tmp/addcalendrbot.env && cd \"${VM_DEPLOY_PATH}\" && chmod +x update.sh && sudo ./update.sh"
 
           "${SSH[@]}" "${VM_USER}@${VM_HOST}" \
             "sudo systemctl --no-pager status addcalendrbot || true"
