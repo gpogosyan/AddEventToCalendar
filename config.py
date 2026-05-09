@@ -16,12 +16,12 @@ def _require(name: str) -> str:
             f"Отсутствует переменная окружения {name}. "
             "Скопируйте .env.example в .env и заполните значения."
         )
-    return v
+    return v.strip()
 
 
 TELEGRAM_TOKEN = _require("TELEGRAM_TOKEN")
 OPENAI_API_KEY = _require("OPENAI_API_KEY")
-SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com").strip()
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 EMAIL_LOGIN = _require("EMAIL_LOGIN")
 EMAIL_PASSWORD = _require("EMAIL_PASSWORD")
