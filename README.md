@@ -86,6 +86,15 @@ Rsync **не включает** `.env` и `*.db`, чтобы не затерет
 
 Первая установка на **новой** VM по-прежнему требует одного раза **`sudo ./bootstrap-vm.sh`** (venv и systemd). После этого деплой полностью из GitHub.
 
+#### Если workflow падает на шаге «Prepare SSH and verify connection»
+
+Деплой идёт **с машин GitHub** (не с вашего ноутбука). Нужно одновременно:
+
+1. **Firewall GCP** — на инстансе должен быть разрешён вход **SSH (tcp/22)** с интернета. В [VPC → Firewall rules](https://console.cloud.google.com/networking/firewalls) проверьте правило вроде `default-allow-ssh` или своё: **Ingress**, target — ваша VM (тег сети), **tcp:22**, source **0.0.0.0/0** (или отдельное правило под ваши ограничения). Если разрешён SSH только с вашего домашнего IP, **Actions не подключится** — либо расширьте источник, либо используйте отдельный self-hosted runner на VM.
+2. **`VM_SSH_PRIVATE_KEY`** — в secret должен быть **приватный** ключ (многострочный текст из файла `-----BEGIN OPENSSH PRIVATE KEY-----` … `-----END …-----`), который соответствует **публичному** ключу в `~/.ssh/authorized_keys` пользователя `VM_USER` на VM. Не вставляйте `.pub` файл.
+
+После исправления: **Actions → Deploy to VM → Re-run failed jobs**.
+
 ### Подготовка виртуальной машины
 1. Создайте виртуальную машину в Google Cloud (например, Ubuntu 22.04 LTS)
 2. Подключитесь к VM по SSH

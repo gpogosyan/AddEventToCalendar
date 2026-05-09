@@ -39,9 +39,13 @@ jobs:
           printf '%s\n' "$VM_SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H "$VM_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
-          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
+          if ! ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
             -o BatchMode=yes -o ConnectTimeout=15 \
-            "${VM_USER}@${VM_HOST}" "echo 'SSH OK'"
+            "${VM_USER}@${VM_HOST}" "echo 'SSH OK'"; then
+            echo "::error::SSH from GitHub Actions to ${VM_USER}@${VM_HOST} failed."
+            echo "::error::Частые причины: (1) в GCP firewall для VM не разрешён вход с интернета на порт 22 — см. README; (2) в secret VM_SSH_PRIVATE_KEY должен быть ПРИВАТНЫЙ ключ (тот же, что в DarionPass), целиком с BEGIN/END."
+            exit 1
+          fi
 
       - name: Rsync codebase to VM
         env:
