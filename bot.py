@@ -829,7 +829,8 @@ def main():
     application.add_handler(CommandHandler('remove_email', remove_email_command))
     application.add_handler(CommandHandler('add_email', add_email_command))
     application.add_handler(CommandHandler('menu', menu_command))
-    application.run_polling()
+    # Иначе inline-кнопки не получают callback_query (см. PTB: allowed_updates).
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
     main() 
