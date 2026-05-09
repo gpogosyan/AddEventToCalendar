@@ -58,10 +58,33 @@ chmod +x deploy.sh
 
 Rsync **не включает** `.env` и `*.db`, чтобы не затереть продакшен.
 
-### Автодеплой из GitHub Actions
+### Автодеплой из GitHub Actions (без ручной заливки `.env` на VM)
 
-Secrets для SSH: `VM_HOST`, `VM_USER`, `VM_SSH_PRIVATE_KEY`, `VM_DEPLOY_PATH` (как у DarionPass).  
-Workflow обновляет только код из git; **файл `.env` на сервере нужно создать вручную один раз** (или дописать шаг, который собирает env из GitHub Secrets — отдельная настройка).
+В **Settings → Secrets and variables → Actions** задайте:
+
+**SSH и путь (как у DarionPass):**
+
+| Secret | Пример |
+|--------|--------|
+| `VM_HOST` | `34.41.134.183` |
+| `VM_USER` | `gregorypogosyan` |
+| `VM_DEPLOY_PATH` | `/home/gregorypogosyan/addcalendrbot/` |
+| `VM_SSH_PRIVATE_KEY` | содержимое приватного ключа (`-----BEGIN …`) |
+
+**Приложение** (workflow сам собирает `/opt/addcalendrbot/.env` на сервере):
+
+| Secret | Обязательно |
+|--------|-------------|
+| `TELEGRAM_TOKEN` | да |
+| `OPENAI_API_KEY` | да |
+| `EMAIL_LOGIN` | да |
+| `EMAIL_PASSWORD` | да (для Gmail — [пароль приложения](https://myaccount.google.com/apppasswords)) |
+| `SMTP_SERVER` | нет (по умолчанию `smtp.gmail.com`) |
+| `SMTP_PORT` | нет (по умолчанию `465`) |
+
+При каждом пуше в `main` (или запуске workflow вручную) выполняются: rsync кода → запись `.env` из Secrets → `sudo ./update.sh` → перезапуск сервиса.
+
+Первая установка на **новой** VM по-прежнему требует одного раза **`sudo ./bootstrap-vm.sh`** (venv и systemd). После этого деплой полностью из GitHub.
 
 ### Подготовка виртуальной машины
 1. Создайте виртуальную машину в Google Cloud (например, Ubuntu 22.04 LTS)

@@ -1,12 +1,16 @@
-# Деплой на ту же GCP VM, что и DarionPass (rsync по SSH + sudo update.sh).
-# В репозитории GitHub: Settings → Secrets and variables → Actions:
-#   VM_HOST              — например 34.41.134.183
-#   VM_USER              — например gregorypogosyan
-#   VM_DEPLOY_PATH       — абсолютный путь, например /home/gregorypogosyan/addcalendrbot/
-#   VM_SSH_PRIVATE_KEY   — содержимое ~/.ssh/darionpass_gcp (-----BEGIN …)
+# Деплой на GCP VM: rsync кода + запись /opt/addcalendrbot/.env из GitHub Actions Secrets + update.sh
 #
-# Файл .env с секретами на сервере не в репозитории и исключён из rsync.
-# Один раз создайте .env на VM вручную (см. README).
+# Settings → Secrets and variables → Actions:
+#
+# SSH / путь:
+#   VM_HOST, VM_USER, VM_DEPLOY_PATH, VM_SSH_PRIVATE_KEY
+#
+# Секреты приложения (обязательные):
+#   TELEGRAM_TOKEN, OPENAI_API_KEY, EMAIL_LOGIN, EMAIL_PASSWORD
+#
+# Опционально:
+#   SMTP_SERVER   (по умолчанию smtp.gmail.com)
+#   SMTP_PORT     (по умолчанию 465)
 
 name: Deploy to VM
 
@@ -33,12 +37,22 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H "$VM_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
 
-      - name: Rsync and update service
+      - name: Rsync, push .env from Secrets, restart service
         env:
           VM_HOST: ${{ secrets.VM_HOST }}
           VM_USER: ${{ secrets.VM_USER }}
           VM_DEPLOY_PATH: ${{ secrets.VM_DEPLOY_PATH }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          EMAIL_LOGIN: ${{ secrets.EMAIL_LOGIN }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
         run: |
+          set -euo pipefail
+          SSH=(ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new)
+          SCP=(scp -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new)
+
           RSYNC_EXCLUDES=(
             --exclude='.git'
             --exclude='.github'
@@ -59,10 +73,39 @@ jobs:
             -e "ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" \
             ./ "${VM_USER}@${VM_HOST}:${VM_DEPLOY_PATH}"
 
-          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
-            "${VM_USER}@${VM_HOST}" \
-            "cd ${VM_DEPLOY_PATH} && chmod +x update.sh && sudo ./update.sh"
+          python3 << 'PY' > .env.remote
+          import os
+          import shlex
+          import sys
 
-          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
-            "${VM_USER}@${VM_HOST}" \
+          def req(name: str) -> str:
+              v = (os.environ.get(name) or "").strip()
+              if not v:
+                  print(f"Error: GitHub Actions secret {name!r} is not set", file=sys.stderr)
+                  sys.exit(1)
+              return v
+
+          def opt(name: str, default: str) -> str:
+              v = (os.environ.get(name) or "").strip()
+              return v if v else default
+
+          lines = [
+              f"TELEGRAM_TOKEN={shlex.quote(req('TELEGRAM_TOKEN'))}",
+              f"OPENAI_API_KEY={shlex.quote(req('OPENAI_API_KEY'))}",
+              f"SMTP_SERVER={shlex.quote(opt('SMTP_SERVER', 'smtp.gmail.com'))}",
+              f"SMTP_PORT={shlex.quote(opt('SMTP_PORT', '465'))}",
+              f"EMAIL_LOGIN={shlex.quote(req('EMAIL_LOGIN'))}",
+              f"EMAIL_PASSWORD={shlex.quote(req('EMAIL_PASSWORD'))}",
+          ]
+          sys.stdout.write("\n".join(lines) + "\n")
+          PY
+
+          chmod 600 .env.remote
+          "${SCP[@]}" .env.remote "${VM_USER}@${VM_HOST}:/tmp/addcalendrbot.env"
+          rm -f .env.remote
+
+          "${SSH[@]}" "${VM_USER}@${VM_HOST}" \
+            "sudo install -m 600 -o addcalendrbot -g addcalendrbot /tmp/addcalendrbot.env /opt/addcalendrbot/.env && rm -f /tmp/addcalendrbot.env && cd ${VM_DEPLOY_PATH} && chmod +x update.sh && sudo ./update.sh"
+
+          "${SSH[@]}" "${VM_USER}@${VM_HOST}" \
             "sudo systemctl --no-pager status addcalendrbot || true"
