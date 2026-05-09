@@ -1,12 +1,15 @@
 import logging
+import os
 import sqlite3
 import smtplib
+import tempfile
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
-from telegram import Update, ForceReply, ReplyKeyboardMarkup, ReplyKeyboardRemove
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram.constants import ChatAction
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 import openai
 import config
 import datetime
@@ -40,6 +43,17 @@ conn = sqlite3.connect('users.db', check_same_thread=False)
 c = conn.cursor()
 c.execute('''CREATE TABLE IF NOT EXISTS users (chat_id INTEGER, email TEXT)''')
 conn.commit()
+# Удаляем дубликаты (chat_id, email) и добавляем уникальный индекс
+c.execute(
+    '''DELETE FROM users WHERE rowid NOT IN (
+        SELECT MIN(rowid) FROM users GROUP BY chat_id, email
+    )'''
+)
+conn.commit()
+c.execute(
+    'CREATE UNIQUE INDEX IF NOT EXISTS ux_users_chat_email ON users(chat_id, email)'
+)
+conn.commit()
 
 # Состояния для ConversationHandler
 EMAIL, CONFIRM_EVENT, CHOOSE_FIELD, EDIT_NAME, EDIT_DATE, EDIT_TIME, EDIT_LOCATION, EDIT_COMMENT = range(8)
@@ -47,9 +61,15 @@ EMAIL, CONFIRM_EVENT, CHOOSE_FIELD, EDIT_NAME, EDIT_DATE, EDIT_TIME, EDIT_LOCATI
 # Установка ключа OpenAI
 client = openai.OpenAI(api_key=config.OPENAI_API_KEY)
 
-def add_user(chat_id, email):
-    c.execute('INSERT INTO users (chat_id, email) VALUES (?, ?)', (chat_id, email))
-    conn.commit()
+def add_user(chat_id, email) -> bool:
+    """Возвращает True, если email добавлен, False если такая пара уже была."""
+    try:
+        c.execute('INSERT INTO users (chat_id, email) VALUES (?, ?)', (chat_id, email))
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        return False
 
 def get_emails_in_chat(chat_id):
     c.execute('SELECT email FROM users WHERE chat_id=?', (chat_id,))
@@ -62,6 +82,31 @@ def clear_emails_in_chat(chat_id):
 def remove_email_in_chat(chat_id, email):
     c.execute('DELETE FROM users WHERE chat_id=? AND email=?', (chat_id, email))
     conn.commit()
+
+
+def event_missing_required_fields(event: dict) -> list:
+    """Поля, без которых нельзя собрать приглашение (время подставляется по умолчанию)."""
+    missing = []
+    if not (event.get('name') or '').strip():
+        missing.append('название')
+    if not (event.get('date') or '').strip():
+        missing.append('дата')
+    if not (event.get('location') or '').strip():
+        missing.append('место')
+    return missing
+
+
+async def _user_may_manage_recipients(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """В группах список получателей меняют только админы и владелец."""
+    chat = update.effective_chat
+    if not chat or chat.type not in ('group', 'supergroup'):
+        return True
+    try:
+        m = await context.bot.get_chat_member(chat.id, update.effective_user.id)
+        return m.status in ('creator', 'administrator')
+    except Exception:
+        return False
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     chat_id = update.effective_chat.id
@@ -87,8 +132,12 @@ async def register_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
         await update.message.reply_text('Похоже, это не email. Пожалуйста, введите корректный email.')
         return EMAIL
-    add_user(chat_id, email)
-    await update.message.reply_text(f'Email {email} сохранён! Теперь отправьте информацию о событии.')
+    if add_user(chat_id, email):
+        await update.message.reply_text(f'Email {email} сохранён! Теперь отправьте информацию о событии.')
+    else:
+        await update.message.reply_text(
+            f'Email {email} уже был в списке. Можете прислать описание события.'
+        )
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -110,6 +159,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not emails:
         await update.message.reply_text('Сначала зарегистрируйте email командой /start.')
         return
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id, action=ChatAction.TYPING
+    )
     await update.message.reply_text('Получено текстовое сообщение. Отправляю в LLM для извлечения параметров события...')
     # Запрос к LLM
     prompt = f"""
@@ -131,10 +183,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     #    await update.message.reply_text(f'Параметры события успешно извлечены!\n{result}')
         event = parse_event_info(result)
         event['comment'] = ''
+        missing = event_missing_required_fields(event)
+        if missing:
+            await update.message.reply_text(
+                'В тексте не хватает: '
+                + ', '.join(missing)
+                + '.\nПришлите описание события ещё раз, явно указав эти данные.'
+            )
+            return ConversationHandler.END
         context.user_data['event'] = event
         return await show_event_and_confirm(update, context)
     except Exception as e:
-        await update.message.reply_text(f'Ошибка LLM: {e}')
+        logger.exception('LLM error: %s', e)
+        await update.message.reply_text(
+            'Не получилось разобрать событие. Попробуйте короче указать '
+            'название, дату, время и место в одном сообщении.'
+        )
         return ConversationHandler.END
 
 async def confirm_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -143,17 +207,7 @@ async def confirm_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
     event = context.user_data.get('event', {})
     if answer.strip().lower() in ['да', 'yes']:
         logger.info(f"context.user_data: {context.user_data}")
-        await update.message.reply_text('Отправляю приглашения на email...', reply_markup=ReplyKeyboardRemove())
-        emails = get_emails_in_chat(update.effective_chat.id)
-        for email in emails:
-            error = send_email(email, event)
-            if error:
-                await update.message.reply_text(f"Ошибка: {error}")
-                context.user_data.clear()
-                return ConversationHandler.END
-        await update.message.reply_text(f'Приглашения отправлены: {", ".join(emails)}')
-        context.user_data.clear()
-        return ConversationHandler.END
+        return await _send_invites_and_finish(update.effective_message, context)
     elif answer.strip().lower() in ['нет', 'no']:
         reply_markup = ReplyKeyboardMarkup([
             ['Name', 'Date'],
@@ -204,26 +258,101 @@ async def set_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     field = context.user_data.get('edit_field')
     if not field:
         return await show_event_and_confirm(update, context)
-    context.user_data['event'][field] = update.message.text.strip()
+    raw = update.message.text.strip()
+    if field == 'date':
+        val = normalize_date(raw)
+    elif field == 'time':
+        val = normalize_time(raw)
+    else:
+        val = raw
+    context.user_data['event'][field] = val
     # После изменения любого поля снова показываем все параметры и спрашиваем подтверждение
     return await show_event_and_confirm(update, context)
 
 async def show_event_and_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     event = context.user_data['event']
-    reply_markup = ReplyKeyboardMarkup([
-        ['Да', 'Нет']
-    ], one_time_keyboard=True, resize_keyboard=True)
-    await update.message.reply_text(
+    msg = update.effective_message
+    body = (
         f"Проверьте параметры события:\n"
         f"Name: {event['name']}\n"
         f"Date: {event['date']}\n"
         f"Time: {event['time']}\n"
         f"Location: {event['location']}\n"
         f"Comments: {event['comment']}\n"
-        "\nВсе верно?",
-        reply_markup=reply_markup
+        f"\nВсё верно? Напишите «Да» или «Нет», либо нажмите кнопку на следующем сообщении."
     )
+    await msg.reply_text(body, reply_markup=ReplyKeyboardRemove())
+    inline = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton('✅ Отправить', callback_data='event_confirm'),
+                InlineKeyboardButton('✏️ Изменить', callback_data='event_edit'),
+            ],
+            [InlineKeyboardButton('❌ Отмена', callback_data='event_cancel')],
+        ]
+    )
+    await msg.reply_text('Подтверждение:', reply_markup=inline)
     return CONFIRM_EVENT
+
+
+async def confirm_event_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ''
+    if data == 'event_cancel':
+        context.user_data.pop('event', None)
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(
+            'Создание события отменено.', reply_markup=ReplyKeyboardRemove()
+        )
+        return ConversationHandler.END
+    if data == 'event_edit':
+        await query.edit_message_reply_markup(reply_markup=None)
+        reply_markup = ReplyKeyboardMarkup(
+            [['Name', 'Date'], ['Time', 'Location'], ['Comment']],
+            one_time_keyboard=True,
+            resize_keyboard=True,
+        )
+        await query.message.reply_text(
+            'Какой параметр хотите исправить?',
+            reply_markup=reply_markup,
+        )
+        return CHOOSE_FIELD
+    if data == 'event_confirm':
+        await query.edit_message_reply_markup(reply_markup=None)
+        return await _send_invites_and_finish(query.message, context)
+    return CONFIRM_EVENT
+
+
+async def _send_invites_and_finish(message, context: ContextTypes.DEFAULT_TYPE):
+    """Отправка приглашений всем адресам чата; итог одним сообщением."""
+    event = context.user_data.get('event', {})
+    chat_id = message.chat_id
+    logger.info('Sending invites for chat_id=%s, event=%s', chat_id, event)
+    await message.reply_text(
+        'Отправляю приглашения на email...', reply_markup=ReplyKeyboardRemove()
+    )
+    emails = get_emails_in_chat(chat_id)
+    if not emails:
+        await message.reply_text('Нет адресов в списке. Сначала /start или /add_email.')
+        context.user_data.clear()
+        return ConversationHandler.END
+    sent, errors = [], []
+    for email in emails:
+        err = send_email(email, event)
+        if err:
+            short = err if len(err) <= 300 else err[:297] + '...'
+            errors.append(f'{email}: {short}')
+        else:
+            sent.append(email)
+    parts = []
+    if sent:
+        parts.append('Отправлено: ' + ', '.join(sent))
+    if errors:
+        parts.append('Не удалось:\n' + '\n'.join(errors))
+    await message.reply_text('\n\n'.join(parts) if parts else 'Нет результатов.')
+    context.user_data.clear()
+    return ConversationHandler.END
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -239,18 +368,29 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'Вы уже редактируете событие. Пожалуйста, завершите подтверждение или редактирование текущего события.'
         )
         return
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id, action=ChatAction.TYPING
+    )
     await update.message.reply_text('Получено изображение. Сохраняю и извлекаю текст с помощью OCR...')
     photo_file = await update.message.photo[-1].get_file()
-    photo_path = f"photo_{chat_id}.jpg"
-    await photo_file.download_to_drive(photo_path)
+    fd, photo_path = tempfile.mkstemp(suffix='.jpg')
     try:
+        os.close(fd)
+        await photo_file.download_to_drive(photo_path)
         reader = _get_easyocr_reader()
         ocr_result = reader.readtext(photo_path, detail=0, paragraph=True)
         text = '\n'.join(ocr_result)
-    #    await update.message.reply_text(f'Текст, извлечённый из изображения:\n{text}\n\nОтправляю в LLM для извлечения параметров события...')
     except Exception as e:
-        await update.message.reply_text(f'Ошибка OCR: {e}')
+        logger.exception('OCR error: %s', e)
+        await update.message.reply_text(
+            'Не удалось прочитать текст с картинки. Попробуйте другое фото или пришлите текст сообщением.'
+        )
         return
+    finally:
+        try:
+            os.unlink(photo_path)
+        except OSError:
+            pass
     # Запрос к LLM
     prompt = f"""
     Извлеки из следующего сообщения параметры события:
@@ -268,13 +408,23 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             messages=[{"role": "user", "content": prompt}]
         )
         result = response.choices[0].message.content
-    #    await update.message.reply_text(f'Параметры события успешно извлечены!\n{result}')
         event = parse_event_info(result)
         event['comment'] = ''
+        missing = event_missing_required_fields(event)
+        if missing:
+            await update.message.reply_text(
+                'По фото не хватает: '
+                + ', '.join(missing)
+                + '.\nПришлите фото или текст ещё раз с явными данными.'
+            )
+            return ConversationHandler.END
         context.user_data['event'] = event
         return await show_event_and_confirm(update, context)
     except Exception as e:
-        await update.message.reply_text(f'Ошибка LLM: {e}')
+        logger.exception('LLM error (photo): %s', e)
+        await update.message.reply_text(
+            'Не получилось разобрать событие. Попробуйте прислать текстом название, дату, время и место.'
+        )
         return ConversationHandler.END
 
 def normalize_date(date_str):
@@ -571,11 +721,21 @@ async def emails_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('В чате нет зарегистрированных email.')
 
 async def clear_emails_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _user_may_manage_recipients(update, context):
+        await update.message.reply_text(
+            'Только администраторы чата могут очистить список email.'
+        )
+        return
     chat_id = update.effective_chat.id
     clear_emails_in_chat(chat_id)
     await update.message.reply_text('Список email очищен.')
 
 async def remove_email_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _user_may_manage_recipients(update, context):
+        await update.message.reply_text(
+            'Только администраторы чата могут удалять email из списка.'
+        )
+        return
     chat_id = update.effective_chat.id
     if context.args:
         email = context.args[0]
@@ -589,15 +749,21 @@ async def remove_email_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text('Пожалуйста, укажите email для удаления. Пример: /remove_email test@example.com')
 
 async def add_email_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _user_may_manage_recipients(update, context):
+        await update.message.reply_text(
+            'Только администраторы чата могут добавлять email в список.'
+        )
+        return
     chat_id = update.effective_chat.id
     if context.args:
         email = context.args[0]
         emails = get_emails_in_chat(chat_id)
         if email in emails:
             await update.message.reply_text(f'Email {email} уже есть в списке.')
-        else:
-            add_user(chat_id, email)
+        elif add_user(chat_id, email):
             await update.message.reply_text(f'Email {email} добавлен.')
+        else:
+            await update.message.reply_text(f'Email {email} уже есть в списке.')
     else:
         await update.message.reply_text('Пожалуйста, укажите email для добавления. Пример: /add_email test@example.com')
 
@@ -605,15 +771,29 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     menu_text = (
         "Доступные команды:\n"
         "/start — регистрация email или начало работы\n"
-        "/add_email <email> — добавить email вручную\n"
-        "/remove_email <email> — удалить email из списка\n"
-        "/clear_emails — очистить весь список email\n"
+        "/add_email <email> — добавить email вручную (в группах — только админы)\n"
+        "/remove_email <email> — удалить email из списка (в группах — только админы)\n"
+        "/clear_emails — очистить весь список email (в группах — только админы)\n"
         "/emails — показать список email\n"
-        "/menu — показать это меню\n"
+        "/menu и /help — это меню\n"
+        "/cancel — отменить подтверждение события или редактирование\n"
         "\n"
         "Вы также можете отправить текстовое сообщение или фотографию с текстом события — бот распознает параметры и отправит приглашение на email."
     )
     await update.message.reply_text(menu_text)
+
+
+async def help_in_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await menu_command(update, context)
+    return None
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text(
+        'Операция отменена.', reply_markup=ReplyKeyboardRemove()
+    )
+    return ConversationHandler.END
 
 def main():
     application = Application.builder().token(config.TELEGRAM_TOKEN).build()
@@ -625,7 +805,10 @@ def main():
         ],
         states={
             EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_email)],
-            CONFIRM_EVENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_event)],
+            CONFIRM_EVENT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_event),
+                CallbackQueryHandler(confirm_event_callback, pattern='^event_'),
+            ],
             CHOOSE_FIELD: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_field)],
             EDIT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_field)],
             EDIT_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_field)],
@@ -633,9 +816,14 @@ def main():
             EDIT_LOCATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_field)],
             EDIT_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_field)],
         },
-        fallbacks=[CommandHandler('menu', menu_command)]
+        fallbacks=[
+            CommandHandler('cancel', cancel),
+            CommandHandler('help', help_in_conversation),
+            CommandHandler('menu', help_in_conversation),
+        ],
     )
     application.add_handler(conv_handler)
+    application.add_handler(CommandHandler('help', menu_command))
     application.add_handler(CommandHandler('emails', emails_command))
     application.add_handler(CommandHandler('clear_emails', clear_emails_command))
     application.add_handler(CommandHandler('remove_email', remove_email_command))
