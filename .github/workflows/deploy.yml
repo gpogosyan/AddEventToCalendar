@@ -35,6 +35,11 @@ jobs:
           : "${VM_USER:?VM_USER secret is empty}"
           : "${VM_DEPLOY_PATH:?VM_DEPLOY_PATH secret is empty}"
           : "${VM_SSH_PRIVATE_KEY:?VM_SSH_PRIVATE_KEY secret is empty}"
+          case "${VM_DEPLOY_PATH,,}" in
+            *addcalendrbot*) ;;
+            *) echo "::error::VM_DEPLOY_PATH должен указывать на каталог календарного бота, например /home/USER/addcalendrbot/ — не используйте путь DarionPass (darionpass)."
+               exit 1 ;;
+          esac
           mkdir -p ~/.ssh
           printf '%s\n' "$VM_SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key

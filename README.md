@@ -68,7 +68,7 @@ Rsync **не включает** `.env` и `*.db`, чтобы не затерет
 |--------|--------|
 | `VM_HOST` | `34.41.134.183` |
 | `VM_USER` | `gregorypogosyan` |
-| `VM_DEPLOY_PATH` | `/home/gregorypogosyan/addcalendrbot/` |
+| `VM_DEPLOY_PATH` | `/home/gregorypogosyan/addcalendrbot/` (**не** `.../darionpass/` — это другой проект) |
 | `VM_SSH_PRIVATE_KEY` | содержимое приватного ключа (`-----BEGIN …`) |
 
 **Приложение** (workflow сам собирает `/opt/addcalendrbot/.env` на сервере):
