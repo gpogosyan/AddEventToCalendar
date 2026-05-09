@@ -549,6 +549,14 @@ def send_email(to_email, event):
         with smtplib.SMTP_SSL(config.SMTP_SERVER, config.SMTP_PORT) as server:
             server.login(config.EMAIL_LOGIN, config.EMAIL_PASSWORD)
             server.sendmail(config.EMAIL_LOGIN, to_email, msg.as_string())
+    except smtplib.SMTPAuthenticationError as e:
+        logger.error('SMTP authentication failed: %s', e)
+        return (
+            "Почта отклонила вход (неверный логин или пароль). "
+            "Для Gmail в EMAIL_PASSWORD нужен пароль приложения, не обычный пароль аккаунта: "
+            "https://myaccount.google.com/apppasswords — после смены пароля на проде обновите "
+            "GitHub Secret EMAIL_PASSWORD и задеплойте снова (или поправьте /opt/addcalendrbot/.env)."
+        )
     except Exception as e:
         logger.error(f'Ошибка отправки email: {e}')
         return f'Ошибка отправки email: {e}'
