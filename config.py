@@ -25,3 +25,5 @@ SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com").strip()
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 EMAIL_LOGIN = _require("EMAIL_LOGIN")
 EMAIL_PASSWORD = _require("EMAIL_PASSWORD")
+# Часовой пояс времени события в боте (локальное «стенное» время в приглашении).
+EVENT_TIMEZONE = os.getenv("EVENT_TIMEZONE", "Europe/Moscow").strip()

@@ -28,12 +28,12 @@ cp .env.example .env
 2. Создайте `.env` (см. выше). Переменные: `TELEGRAM_TOKEN`, `OPENAI_API_KEY`, `EMAIL_LOGIN`, `EMAIL_PASSWORD`; при необходимости `SMTP_SERVER`, `SMTP_PORT`.
 3. Запуск: `python bot.py`
 
-## Развертывание на Google Cloud VM (production)
+## Развертывание на Linux VM (production: GCP/Yandex Cloud)
 
-### Быстрый деплой с ноутбука (та же VM и SSH-ключ, что у DarionPass)
+### Быстрый деплой с ноутбука (любая Linux VM по SSH)
 
-На машине должен быть ключ `~/.ssh/darionpass_gcp` (или задайте `SSH_KEY`).  
-Параметры по умолчанию: `gregorypogosyan@34.41.134.183`, каталог на VM `~/addcalendrbot/`.
+На машине должен быть SSH-ключ (по умолчанию скрипт ищет `~/.ssh/addcalendrbot_vm`, затем `~/.ssh/darionpass_gcp`; можно явно задать `SSH_KEY`).  
+Параметры по умолчанию в `deploy.sh`: `gregorypogosyan@34.41.134.183`, каталог на VM `~/addcalendrbot/` — для Yandex Cloud обычно задают свои `VM_HOST`, `VM_USER`, `VM_PATH`.
 
 **Первый раз на новой VM** (пока нет `/opt/addcalendrbot/venv`):
 
@@ -56,7 +56,7 @@ Rsync **не включает** `.env` и `*.db`, чтобы не затерет
 
 В **Settings → Secrets and variables → Actions** задайте:
 
-**SSH и путь (как у DarionPass):**
+**SSH и путь (для любой VM):**
 
 | Secret | Пример |
 |--------|--------|
@@ -86,13 +86,16 @@ Rsync **не включает** `.env` и `*.db`, чтобы не затерет
 
 Деплой идёт **с машин GitHub** (не с вашего ноутбука). Нужно одновременно:
 
-1. **Firewall GCP** — на инстансе должен быть разрешён вход **SSH (tcp/22)** с интернета. В [VPC → Firewall rules](https://console.cloud.google.com/networking/firewalls) проверьте правило вроде `default-allow-ssh` или своё: **Ingress**, target — ваша VM (тег сети), **tcp:22**, source **0.0.0.0/0** (или отдельное правило под ваши ограничения). Если разрешён SSH только с вашего домашнего IP, **Actions не подключится** — либо расширьте источник, либо используйте отдельный self-hosted runner на VM.
+1. **Сетевые правила для SSH** — на VM должен быть разрешён вход **tcp/22** с интернета.
+   - **GCP**: в [VPC → Firewall rules](https://console.cloud.google.com/networking/firewalls) проверьте Ingress правило на `tcp:22` для нужного инстанса/тега.
+   - **Yandex Cloud**: проверьте VPC Security Group (Ingress `TCP 22`, источник `0.0.0.0/0` или нужный диапазон) и правила на самой ОС (например, `ufw`/`iptables`), чтобы порт реально был открыт.
+   Если SSH разрешён только с вашего домашнего IP, **Actions не подключится** — либо расширьте источник, либо используйте self-hosted runner на VM.
 2. **`VM_SSH_PRIVATE_KEY`** — в secret должен быть **приватный** ключ (многострочный текст из файла `-----BEGIN OPENSSH PRIVATE KEY-----` … `-----END …-----`), который соответствует **публичному** ключу в `~/.ssh/authorized_keys` пользователя `VM_USER` на VM. Не вставляйте `.pub` файл.
 
 После исправления: **Actions → Deploy to VM → Re-run failed jobs**.
 
 ### Подготовка виртуальной машины
-1. Создайте виртуальную машину в Google Cloud (например, Ubuntu 22.04 LTS)
+1. Создайте Linux VM в вашем облаке (например, Ubuntu 22.04 LTS в GCP или Yandex Cloud)
 2. Подключитесь к VM по SSH
 3. Установите Python 3 и pip (если не установлены):
    ```bash
@@ -101,10 +104,12 @@ Rsync **не включает** `.env` и `*.db`, чтобы не затерет
    ```
 
 ### Развертывание бота
-1. Загрузите файлы проекта на VM (через `scp` или `gcloud compute scp`):
+1. Загрузите файлы проекта на VM (через `scp`, `gcloud compute scp` или `yc compute scp`):
    ```bash
    # С вашего локального компьютера:
    gcloud compute scp --recurse . VM_NAME:/tmp/addcalendrbot
+   # Для Yandex Cloud (если настроен CLI):
+   yc compute scp --recurse . user@VM_NAME:/tmp/addcalendrbot
    # Или используйте scp:
    scp -r . user@VM_IP:/tmp/addcalendrbot
    ```

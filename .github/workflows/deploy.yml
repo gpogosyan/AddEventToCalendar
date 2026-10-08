@@ -1,4 +1,5 @@
-# Деплой на GCP VM: rsync кода + запись /opt/addcalendrbot/.env из GitHub Actions Secrets + update.sh
+# Деплой на Linux VM (GCP/Yandex Cloud/другой VPS):
+# rsync кода + запись /opt/addcalendrbot/.env из GitHub Actions Secrets + update.sh
 #
 # Settings → Secrets and variables → Actions → Repository secrets:
 #
@@ -7,7 +8,7 @@
 #
 # Приложение:
 #   TELEGRAM_TOKEN, OPENAI_API_KEY, EMAIL_LOGIN, EMAIL_PASSWORD
-# Опционально: SMTP_SERVER, SMTP_PORT
+# Опционально: SMTP_SERVER, SMTP_PORT, EVENT_TIMEZONE (по умолчанию Europe/Moscow в коде)
 
 name: Deploy to VM
 
@@ -48,7 +49,7 @@ jobs:
             -o BatchMode=yes -o ConnectTimeout=15 \
             "${VM_USER}@${VM_HOST}" "echo 'SSH OK'"; then
             echo "::error::SSH from GitHub Actions to ${VM_USER}@${VM_HOST} failed."
-            echo "::error::Частые причины: (1) в GCP firewall для VM не разрешён вход с интернета на порт 22 — см. README; (2) в secret VM_SSH_PRIVATE_KEY должен быть ПРИВАТНЫЙ ключ (тот же, что в DarionPass), целиком с BEGIN/END."
+            echo "::error::Частые причины: (1) в firewall/security group для VM не разрешён вход из интернета на порт 22 — см. README (для Yandex Cloud: VPC Security Groups и, при необходимости, правила сетевого экрана ОС); (2) в secret VM_SSH_PRIVATE_KEY должен быть ПРИВАТНЫЙ ключ, целиком с BEGIN/END."
             exit 1
           fi
 
@@ -90,6 +91,7 @@ jobs:
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           EMAIL_LOGIN: ${{ secrets.EMAIL_LOGIN }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EVENT_TIMEZONE: ${{ secrets.EVENT_TIMEZONE }}
         run: |
           set -euo pipefail
           : "${TELEGRAM_TOKEN:?TELEGRAM_TOKEN secret is empty}"
@@ -120,6 +122,7 @@ jobs:
               f"SMTP_PORT={shlex.quote(opt('SMTP_PORT', '465'))}",
               f"EMAIL_LOGIN={shlex.quote(req('EMAIL_LOGIN'))}",
               f"EMAIL_PASSWORD={shlex.quote(req('EMAIL_PASSWORD'))}",
+              f"EVENT_TIMEZONE={shlex.quote(opt('EVENT_TIMEZONE', 'Europe/Moscow'))}",
           ]
           sys.stdout.write("\n".join(lines) + "\n")
           PY

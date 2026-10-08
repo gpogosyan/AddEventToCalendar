@@ -10,6 +10,8 @@ Environment="PATH=/usr/bin:/usr/local/bin"
 ExecStart=/opt/addcalendrbot/venv/bin/python3 /opt/addcalendrbot/bot.py
 Restart=always
 RestartSec=10
+# Перезапуск каждые 10 ч (защита от «зависшего» long-poll без логов)
+RuntimeMaxSec=10h
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=addcalendrbot

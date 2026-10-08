@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Синхронизация проекта с GCP VM и обновление systemd-сервиса (аналог DarionPass).
+# Синхронизация проекта с Linux VM (GCP/Yandex Cloud/другой VPS)
+# и обновление systemd-сервиса.
 # Usage: ./deploy.sh
 #
 # Локальные переменные (как в DarionPass):
@@ -14,7 +15,20 @@ set -euo pipefail
 VM_USER="${VM_USER:-gregorypogosyan}"
 VM_HOST="${VM_HOST:-34.41.134.183}"
 VM_PATH="${VM_PATH:-~/addcalendrbot/}"
-SSH_KEY="${SSH_KEY:-$HOME/.ssh/darionpass_gcp}"
+SSH_KEY="${SSH_KEY:-}"
+
+if [ -z "${SSH_KEY}" ]; then
+    if [ -f "$HOME/.ssh/addcalendrbot_vm" ]; then
+        SSH_KEY="$HOME/.ssh/addcalendrbot_vm"
+    elif [ -f "$HOME/.ssh/darionpass_gcp" ]; then
+        # Обратная совместимость со старым именем ключа.
+        SSH_KEY="$HOME/.ssh/darionpass_gcp"
+    else
+        echo "ОШИБКА: SSH-ключ не найден."
+        echo "Укажите SSH_KEY=/path/to/private_key или создайте ~/.ssh/addcalendrbot_vm"
+        exit 1
+    fi
+fi
 
 SSH_OPTS="-i ${SSH_KEY} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
 

@@ -13,6 +13,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Mess
 import openai
 import config
 import datetime
+from zoneinfo import ZoneInfo
 import uuid
 import re
 import threading
@@ -636,6 +637,16 @@ def parse_event_info(event_info):
             result['location'] = line.split(':', 1)[1].strip()
     return result
 
+def _event_timezone() -> ZoneInfo:
+    try:
+        return ZoneInfo(config.EVENT_TIMEZONE)
+    except Exception as e:
+        raise ValueError(
+            f"Неверный EVENT_TIMEZONE={config.EVENT_TIMEZONE!r}: {e}. "
+            "Пример: Europe/Moscow"
+        ) from e
+
+
 def create_ics(event, organizer_email, attendee_email):
     """
     Создаёт строку .ics для календарного события с поддержкой RSVP (ответа на приглашение)
@@ -645,19 +656,25 @@ def create_ics(event, organizer_email, attendee_email):
     """
     date = event['date']
     time = event['time']
+    tz = _event_timezone()
     try:
         if '-' in time:
             start_time, end_time = [t.strip() for t in time.split('-')]
         else:
             start_time = time.strip()
             end_time = start_time
-        dt_start = datetime.datetime.strptime(date + ' ' + start_time, '%d.%m.%Y %H:%M')
-        dt_end = datetime.datetime.strptime(date + ' ' + end_time, '%d.%m.%Y %H:%M')
+        dt_start = datetime.datetime.strptime(
+            date + ' ' + start_time, '%d.%m.%Y %H:%M'
+        ).replace(tzinfo=tz)
+        dt_end = datetime.datetime.strptime(
+            date + ' ' + end_time, '%d.%m.%Y %H:%M'
+        ).replace(tzinfo=tz)
     except Exception as e:
         raise ValueError(f"Ошибка разбора даты/времени: {e}. Проверьте формат даты (ДД.ММ.ГГГГ) и времени (ЧЧ:ММ или ЧЧ:ММ-ЧЧ:ММ).")
-    dtstamp = datetime.datetime.now().strftime('%Y%m%dT%H%M%SZ')
+    dtstamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     dtstart = dt_start.strftime('%Y%m%dT%H%M%S')
     dtend = dt_end.strftime('%Y%m%dT%H%M%S')
+    tzid = config.EVENT_TIMEZONE
     uid = str(uuid.uuid4())
     description = f"Приглашение на событие. Комментарий: {event.get('comment', '')}\nПожалуйста, выберите ответ: Пойду/Не пойду"
     ics = f"""BEGIN:VCALENDAR
@@ -667,8 +684,8 @@ METHOD:REQUEST
 BEGIN:VEVENT
 UID:{uid}
 DTSTAMP:{dtstamp}
-DTSTART:{dtstart}
-DTEND:{dtend}
+DTSTART;TZID={tzid}:{dtstart}
+DTEND;TZID={tzid}:{dtend}
 SUMMARY:{event['name']}
 LOCATION:{event['location']}
 DESCRIPTION:{description}
