@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import sqlite3
@@ -5,10 +6,9 @@ import smtplib
 import tempfile
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
-from email import encoders
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 from telegram.constants import ChatAction
+from telegram.error import BadRequest
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 import openai
 import config
@@ -56,8 +56,60 @@ c.execute(
 )
 conn.commit()
 
+# Отправленные встречи: нужны, чтобы потом изменить или отменить их по тому же UID.
+c.execute('''CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    uid TEXT NOT NULL UNIQUE,
+    sequence INTEGER NOT NULL DEFAULT 0,
+    name TEXT NOT NULL,
+    date TEXT NOT NULL,
+    time TEXT NOT NULL,
+    location TEXT NOT NULL,
+    comment TEXT NOT NULL DEFAULT '',
+    starts_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_by INTEGER,
+    created_by_name TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)''')
+c.execute('CREATE INDEX IF NOT EXISTS ix_events_chat ON events(chat_id, status, starts_at)')
+c.execute('''CREATE TABLE IF NOT EXISTS event_recipients (
+    event_id INTEGER NOT NULL REFERENCES events(id),
+    email TEXT NOT NULL,
+    PRIMARY KEY (event_id, email)
+)''')
+conn.commit()
+
 # Состояния для ConversationHandler
-EMAIL, CONFIRM_EVENT, CHOOSE_FIELD, EDIT_NAME, EDIT_DATE, EDIT_TIME, EDIT_LOCATION, EDIT_COMMENT = range(8)
+EMAIL, CONFIRM_EVENT, CHOOSE_FIELD, EDIT_VALUE, CONFIRM_UPDATE = range(5)
+
+EVENT_FIELDS = [
+    ('name', 'Название'),
+    ('date', 'Дата'),
+    ('time', 'Время'),
+    ('location', 'Место'),
+    ('comment', 'Комментарий'),
+]
+FIELD_LABELS = dict(EVENT_FIELDS)
+# Текстовые названия полей, которые принимаются вместо нажатия кнопки.
+FIELD_ALIASES = {
+    **{key: key for key, _ in EVENT_FIELDS},
+    **{label.lower(): key for key, label in EVENT_FIELDS},
+}
+FIELD_PROMPTS = {
+    'name': 'Введите новое название события:',
+    'date': 'Введите новую дату события (например, 10.06.2026):',
+    'time': 'Введите новое время события (например, 13:30-15:00):',
+    'location': 'Введите новое место проведения события:',
+    'comment': 'Введите новый комментарий (или «-», чтобы очистить):',
+}
+EVENTS_PAGE_SIZE = 10
+EVENT_DB_COLUMNS = (
+    'id', 'chat_id', 'uid', 'sequence', 'name', 'date', 'time', 'location',
+    'comment', 'starts_at', 'status', 'created_by', 'created_by_name',
+)
 
 # Установка ключа OpenAI
 client = openai.OpenAI(api_key=config.OPENAI_API_KEY)
@@ -85,6 +137,95 @@ def remove_email_in_chat(chat_id, email):
     conn.commit()
 
 
+def _utc_iso(dt: datetime.datetime) -> str:
+    return dt.astimezone(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def _now_iso() -> str:
+    return _utc_iso(datetime.datetime.now(datetime.timezone.utc))
+
+
+def save_event(chat_id, event, uid, user, recipients) -> int:
+    dt_start, _ = event_datetimes(event)
+    now = _now_iso()
+    author = f'@{user.username}' if user.username else user.full_name
+    c.execute(
+        '''INSERT INTO events (chat_id, uid, sequence, name, date, time, location, comment,
+               starts_at, created_by, created_by_name, created_at, updated_at)
+           VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+        (
+            chat_id, uid, event['name'], event['date'], event['time'], event['location'],
+            event.get('comment') or '', _utc_iso(dt_start), user.id, author, now, now,
+        ),
+    )
+    event_id = c.lastrowid
+    c.executemany(
+        'INSERT OR IGNORE INTO event_recipients (event_id, email) VALUES (?, ?)',
+        [(event_id, email) for email in recipients],
+    )
+    conn.commit()
+    return event_id
+
+
+def get_event(event_id):
+    c.execute(
+        f'SELECT {", ".join(EVENT_DB_COLUMNS)} FROM events WHERE id=?', (event_id,)
+    )
+    row = c.fetchone()
+    return dict(zip(EVENT_DB_COLUMNS, row)) if row else None
+
+
+def update_event(event_id, event, sequence):
+    dt_start, _ = event_datetimes(event)
+    c.execute(
+        '''UPDATE events SET name=?, date=?, time=?, location=?, comment=?, starts_at=?,
+               sequence=?, updated_at=? WHERE id=?''',
+        (
+            event['name'], event['date'], event['time'], event['location'],
+            event.get('comment') or '', _utc_iso(dt_start), sequence, _now_iso(), event_id,
+        ),
+    )
+    conn.commit()
+
+
+def cancel_event(event_id, sequence):
+    c.execute(
+        "UPDATE events SET status='cancelled', sequence=?, updated_at=? WHERE id=?",
+        (sequence, _now_iso(), event_id),
+    )
+    conn.commit()
+
+
+def get_event_recipients(event_id):
+    c.execute('SELECT email FROM event_recipients WHERE event_id=? ORDER BY rowid', (event_id,))
+    return [row[0] for row in c.fetchall()]
+
+
+def add_event_recipients(event_id, emails):
+    c.executemany(
+        'INSERT OR IGNORE INTO event_recipients (event_id, email) VALUES (?, ?)',
+        [(event_id, email) for email in emails],
+    )
+    conn.commit()
+
+
+def list_upcoming_events(chat_id, offset, limit):
+    """Активные встречи чата, которые ещё не начались: (страница, общее число)."""
+    now = _now_iso()
+    c.execute(
+        "SELECT COUNT(*) FROM events WHERE chat_id=? AND status='active' AND starts_at>=?",
+        (chat_id, now),
+    )
+    total = c.fetchone()[0]
+    c.execute(
+        f'''SELECT {", ".join(EVENT_DB_COLUMNS)} FROM events
+            WHERE chat_id=? AND status='active' AND starts_at>=?
+            ORDER BY starts_at, id LIMIT ? OFFSET ?''',
+        (chat_id, now, limit, offset),
+    )
+    return [dict(zip(EVENT_DB_COLUMNS, row)) for row in c.fetchall()], total
+
+
 def event_missing_required_fields(event: dict) -> list:
     """Поля, без которых нельзя собрать приглашение (время подставляется по умолчанию)."""
     missing = []
@@ -97,16 +238,116 @@ def event_missing_required_fields(event: dict) -> list:
     return missing
 
 
-async def _user_may_manage_recipients(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """В группах список получателей меняют только админы и владелец."""
-    chat = update.effective_chat
-    if not chat or chat.type not in ('group', 'supergroup'):
-        return True
+def _is_group(chat) -> bool:
+    return bool(chat) and chat.type in ('group', 'supergroup')
+
+
+async def _is_chat_admin(context: ContextTypes.DEFAULT_TYPE, chat_id, user_id) -> bool:
     try:
-        m = await context.bot.get_chat_member(chat.id, update.effective_user.id)
+        m = await context.bot.get_chat_member(chat_id, user_id)
         return m.status in ('creator', 'administrator')
     except Exception:
         return False
+
+
+async def _user_may_manage_recipients(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """В группах список получателей меняют только админы и владелец."""
+    chat = update.effective_chat
+    if not _is_group(chat):
+        return True
+    return await _is_chat_admin(context, chat.id, update.effective_user.id)
+
+
+async def _user_may_manage_event(update: Update, context: ContextTypes.DEFAULT_TYPE, row) -> bool:
+    """В группах встречу меняют и удаляют её автор и админы чата."""
+    chat = update.effective_chat
+    if not _is_group(chat):
+        return True
+    if row['created_by'] == update.effective_user.id:
+        return True
+    return await _is_chat_admin(context, chat.id, update.effective_user.id)
+
+
+async def _check_event_access(update: Update, context: ContextTypes.DEFAULT_TYPE, event_id):
+    """(встреча, None), если её можно менять, иначе (None, текст причины)."""
+    row = get_event(event_id)
+    if not row or row['chat_id'] != update.effective_chat.id:
+        return None, 'Встреча не найдена.'
+    if row['status'] != 'active':
+        return None, 'Встреча уже удалена.'
+    if row['starts_at'] < _now_iso():
+        return None, 'Встреча уже прошла, её нельзя изменить или удалить.'
+    if not await _user_may_manage_event(update, context, row):
+        return None, 'Изменять и удалять встречу могут только её автор и админы чата.'
+    return row, None
+
+
+def _ru_plural(n, one, few, many) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
+
+
+def format_event(event) -> str:
+    comment = (event.get('comment') or '').strip() or '—'
+    return (
+        f"«{event['name']}»\n"
+        f"📅 {event['date']}  🕙 {event['time']}\n"
+        f"📍 {event['location']}\n"
+        f"💬 {comment}"
+    )
+
+
+def _delivery_report(groups) -> str:
+    """groups: [(заголовок, отправлено, ошибки)] → текст отчёта о рассылке."""
+    parts = []
+    for title, sent, errors in groups:
+        if sent:
+            parts.append(f'{title}: ' + ', '.join(sent))
+        if errors:
+            parts.append('Не удалось:\n' + '\n'.join(errors))
+    return '\n\n'.join(parts) if parts else 'Нет результатов.'
+
+
+def _event_actions_keyboard(event_id, back_to_list=False) -> InlineKeyboardMarkup:
+    rows = [[
+        InlineKeyboardButton('✏️ Изменить', callback_data=f'ev:edit:{event_id}'),
+        InlineKeyboardButton('🗑 Удалить', callback_data=f'ev:del:{event_id}'),
+    ]]
+    if back_to_list:
+        rows.append([InlineKeyboardButton('⬅️ К списку', callback_data='ev:list:0')])
+    return InlineKeyboardMarkup(rows)
+
+
+FIELD_PICKER = InlineKeyboardMarkup([
+    [
+        InlineKeyboardButton('Название', callback_data='field:name'),
+        InlineKeyboardButton('Дата', callback_data='field:date'),
+        InlineKeyboardButton('Время', callback_data='field:time'),
+    ],
+    [
+        InlineKeyboardButton('Место', callback_data='field:location'),
+        InlineKeyboardButton('Комментарий', callback_data='field:comment'),
+    ],
+    [InlineKeyboardButton('❌ Отмена', callback_data='field:cancel')],
+])
+
+
+async def _safe_edit_text(message, text, reply_markup=None):
+    try:
+        await message.edit_text(text, reply_markup=reply_markup)
+    except BadRequest as e:
+        if 'not modified' not in str(e).lower():
+            raise
+
+
+async def _drop_buttons(query):
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except BadRequest:
+        pass
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -192,6 +433,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 + '.\nПришлите описание события ещё раз, явно указав эти данные.'
             )
             return ConversationHandler.END
+        context.user_data.clear()
         context.user_data['event'] = event
         return await show_event_and_confirm(update, context)
     except Exception as e:
@@ -203,86 +445,102 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
 async def confirm_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"confirm_event called with text: {update.message.text}")
     answer = update.message.text.strip().lower()
-    event = context.user_data.get('event', {})
-    if answer.strip().lower() in ['да', 'yes']:
-        logger.info(f"context.user_data: {context.user_data}")
-        return await _send_invites_and_finish(update.effective_message, context)
-    elif answer.strip().lower() in ['нет', 'no']:
-        reply_markup = ReplyKeyboardMarkup([
-            ['Name', 'Date'],
-            ['Time', 'Location'],
-            ['Comment']
-        ], one_time_keyboard=True, resize_keyboard=True)
-        await update.message.reply_text(
-            'Какой параметр хотите исправить?',
-            reply_markup=reply_markup
-        )
-        return CHOOSE_FIELD
+    event = context.user_data.get('event')
+    if event is None:
+        return await _conversation_lost(update.effective_message, context)
+    if answer in ['да', 'yes']:
+        return await _send_invites_and_finish(update.effective_message, context, update.effective_user)
+    if answer in ['нет', 'no']:
+        return await _ask_field(update.effective_message, context)
+    # Любой другой текст считаем комментарием к событию
+    event['comment'] = update.message.text.strip()
+    return await show_event_and_confirm(update, context)
+
+
+async def _conversation_lost(message, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await message.reply_text('Не нашла черновик события. Пришлите описание события заново.')
+    return ConversationHandler.END
+
+
+async def _ask_field(message, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get('edit_event_id'):
+        text = f"Что изменить во встрече «{context.user_data['original']['name']}»?"
     else:
-        # Если пользователь ввел комментарий
-        event['comment'] = update.message.text.strip()
-        context.user_data['event'] = event
-        return await show_event_and_confirm(update, context)
+        text = 'Какой параметр хотите исправить?'
+    await message.reply_text(text, reply_markup=FIELD_PICKER)
+    return CHOOSE_FIELD
+
+
+async def _ask_value(message, context: ContextTypes.DEFAULT_TYPE, field):
+    context.user_data['edit_field'] = field
+    current = (context.user_data['event'].get(field) or '').strip() or '—'
+    await message.reply_text(f'Сейчас: {current}\n{FIELD_PROMPTS[field]}')
+    return EDIT_VALUE
+
+
+async def _cancel_editing(message, context: ContextTypes.DEFAULT_TYPE):
+    text = 'Изменение встречи отменено.' if context.user_data.get('edit_event_id') else 'Создание события отменено.'
+    context.user_data.clear()
+    await message.reply_text(text, reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
+
 
 async def edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    field = update.message.text.strip().lower()
-    field_map = {
-        'name': ('name', EDIT_NAME),
-        'date': ('date', EDIT_DATE),
-        'time': ('time', EDIT_TIME),
-        'location': ('location', EDIT_LOCATION),
-        'comment': ('comment', EDIT_COMMENT),
-    }
-    if field in field_map:
-        context.user_data['edit_field'] = field_map[field][0]
-        prompts = {
-            'name': 'Введите новое название события:',
-            'date': 'Введите новую дату события (например, 10.06.2024):',
-            'time': 'Введите новое время события (например, 13:30-15:00):',
-            'location': 'Введите новое место проведения события:',
-            'comment': 'Введите новый комментарий:',
-        }
-        await update.message.reply_text(prompts[field_map[field][0]], reply_markup=ReplyKeyboardRemove())
-        return field_map[field][1]
-    else:
-        reply_markup = ReplyKeyboardMarkup([
-            ['Name', 'Date'],
-            ['Time', 'Location'],
-            ['Comment']
-        ], one_time_keyboard=True, resize_keyboard=True)
-        await update.message.reply_text('Пожалуйста, выберите одно из полей: Name/Date/Time/Location/Comment', reply_markup=reply_markup)
-        return CHOOSE_FIELD
+    """Выбор поля текстом (Name/Название и т.п.) вместо кнопки."""
+    if context.user_data.get('event') is None:
+        return await _conversation_lost(update.effective_message, context)
+    field = FIELD_ALIASES.get(update.message.text.strip().lower())
+    if field:
+        return await _ask_value(update.effective_message, context, field)
+    await update.message.reply_text('Выберите поле кнопкой ниже.', reply_markup=FIELD_PICKER)
+    return CHOOSE_FIELD
+
+
+async def edit_field_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await _drop_buttons(query)
+    if context.user_data.get('event') is None:
+        return await _conversation_lost(query.message, context)
+    field = (query.data or '').split(':', 1)[1]
+    if field == 'cancel':
+        return await _cancel_editing(query.message, context)
+    if field not in FIELD_LABELS:
+        return await _ask_field(query.message, context)
+    return await _ask_value(query.message, context, field)
+
 
 async def set_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     field = context.user_data.get('edit_field')
+    event = context.user_data.get('event')
+    if event is None:
+        return await _conversation_lost(update.effective_message, context)
     if not field:
-        return await show_event_and_confirm(update, context)
+        return await _ask_field(update.effective_message, context)
     raw = update.message.text.strip()
     if field == 'date':
         val = normalize_date(raw)
+        if not re.fullmatch(r'\d{2}\.\d{2}\.\d{4}', val):
+            await update.message.reply_text('Не удалось распознать дату. Пример: 10.06.2026')
+            return EDIT_VALUE
     elif field == 'time':
         val = normalize_time(raw)
+    elif field == 'comment' and raw == '-':
+        val = ''
     else:
         val = raw
-    context.user_data['event'][field] = val
+    event[field] = val
+    context.user_data.pop('edit_field', None)
+    if context.user_data.get('edit_event_id'):
+        return await show_update_preview(update.effective_message, context)
     # После изменения любого поля снова показываем все параметры и спрашиваем подтверждение
     return await show_event_and_confirm(update, context)
 
+
 async def show_event_and_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     event = context.user_data['event']
-    msg = update.effective_message
-    body = (
-        f"Проверьте параметры события:\n"
-        f"Name: {event['name']}\n"
-        f"Date: {event['date']}\n"
-        f"Time: {event['time']}\n"
-        f"Location: {event['location']}\n"
-        f"Comments: {event['comment']}\n"
-        f"\nВсё верно? Напишите «Да» или «Нет», либо нажмите кнопку на следующем сообщении."
-    )
-    await msg.reply_text(body, reply_markup=ReplyKeyboardRemove())
     inline = InlineKeyboardMarkup(
         [
             [
@@ -292,68 +550,341 @@ async def show_event_and_confirm(update: Update, context: ContextTypes.DEFAULT_T
             [InlineKeyboardButton('❌ Отмена', callback_data='event_cancel')],
         ]
     )
-    await msg.reply_text('Подтверждение:', reply_markup=inline)
+    await update.effective_message.reply_text(
+        'Проверьте параметры события:\n\n'
+        + format_event(event)
+        + '\n\nВсё верно? Нажмите кнопку или напишите «Да» / «Нет». '
+        'Любой другой текст станет комментарием к событию.',
+        reply_markup=inline,
+    )
     return CONFIRM_EVENT
 
 
 async def confirm_event_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await _drop_buttons(query)
     data = query.data or ''
+    if context.user_data.get('event') is None:
+        return await _conversation_lost(query.message, context)
     if data == 'event_cancel':
-        context.user_data.pop('event', None)
-        await query.edit_message_reply_markup(reply_markup=None)
-        await query.message.reply_text(
-            'Создание события отменено.', reply_markup=ReplyKeyboardRemove()
-        )
-        return ConversationHandler.END
+        return await _cancel_editing(query.message, context)
     if data == 'event_edit':
-        await query.edit_message_reply_markup(reply_markup=None)
-        reply_markup = ReplyKeyboardMarkup(
-            [['Name', 'Date'], ['Time', 'Location'], ['Comment']],
-            one_time_keyboard=True,
-            resize_keyboard=True,
-        )
-        await query.message.reply_text(
-            'Какой параметр хотите исправить?',
-            reply_markup=reply_markup,
-        )
-        return CHOOSE_FIELD
+        return await _ask_field(query.message, context)
     if data == 'event_confirm':
-        await query.edit_message_reply_markup(reply_markup=None)
-        return await _send_invites_and_finish(query.message, context)
+        return await _send_invites_and_finish(query.message, context, query.from_user)
     return CONFIRM_EVENT
 
 
-async def _send_invites_and_finish(message, context: ContextTypes.DEFAULT_TYPE):
-    """Отправка приглашений всем адресам чата; итог одним сообщением."""
-    event = context.user_data.get('event', {})
-    chat_id = message.chat_id
-    logger.info('Sending invites for chat_id=%s, event=%s', chat_id, event)
-    await message.reply_text(
-        'Отправляю приглашения на email...', reply_markup=ReplyKeyboardRemove()
-    )
-    emails = get_emails_in_chat(chat_id)
-    if not emails:
-        await message.reply_text('Нет адресов в списке. Сначала /start или /add_email.')
-        context.user_data.clear()
-        return ConversationHandler.END
+async def _deliver(emails, event, uid, sequence, method, subject_prefix):
+    """Рассылает письмо каждому адресу; возвращает (успешные, ошибки)."""
     sent, errors = [], []
     for email in emails:
-        err = send_email(email, event)
+        err = await asyncio.to_thread(
+            send_email, email, event, uid, sequence, method, subject_prefix
+        )
         if err:
             short = err if len(err) <= 300 else err[:297] + '...'
             errors.append(f'{email}: {short}')
         else:
             sent.append(email)
-    parts = []
+    return sent, errors
+
+
+async def _send_invites_and_finish(message, context: ContextTypes.DEFAULT_TYPE, user):
+    """Отправка приглашений всем адресам чата; итог одним сообщением."""
+    event = context.user_data.get('event', {})
+    chat_id = message.chat_id
+    try:
+        event_datetimes(event)
+    except ValueError as e:
+        await message.reply_text(f'{e}\nИсправьте дату или время.')
+        return await _ask_field(message, context)
+    emails = get_emails_in_chat(chat_id)
+    if not emails:
+        await message.reply_text('Нет адресов в списке. Сначала /start или /add_email.')
+        context.user_data.clear()
+        return ConversationHandler.END
+    logger.info('Sending invites for chat_id=%s, event=%s', chat_id, event)
+    await message.reply_text('Отправляю приглашения на email...', reply_markup=ReplyKeyboardRemove())
+    uid = f'{uuid.uuid4()}@addcalendrbot'
+    sent, errors = await _deliver(emails, event, uid, 0, 'REQUEST', 'Приглашение')
+    report = _delivery_report([('Отправлено', sent, errors)])
     if sent:
-        parts.append('Отправлено: ' + ', '.join(sent))
-    if errors:
-        parts.append('Не удалось:\n' + '\n'.join(errors))
-    await message.reply_text('\n\n'.join(parts) if parts else 'Нет результатов.')
+        event_id = save_event(chat_id, event, uid, user, sent)
+        await message.reply_text(
+            'Встреча отправлена.\n\n' + format_event(event) + '\n\n' + report,
+            reply_markup=_event_actions_keyboard(event_id),
+        )
+    else:
+        await message.reply_text(report)
     context.user_data.clear()
     return ConversationHandler.END
+
+
+async def edit_event_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «Изменить» у сохранённой встречи: открывает редактор полей."""
+    query = update.callback_query
+    event_id = int(query.data.split(':')[2])
+    row, error = await _check_event_access(update, context, event_id)
+    if error:
+        await query.answer(error, show_alert=True)
+        return None
+    await query.answer()
+    context.user_data.clear()
+    event = {key: row[key] for key, _ in EVENT_FIELDS}
+    context.user_data.update(
+        event=event,
+        original=dict(event),
+        edit_event_id=event_id,
+        invite_new=False,
+    )
+    return await _ask_field(query.message, context)
+
+
+def _changed_fields(old, new):
+    return [key for key, _ in EVENT_FIELDS if (old.get(key) or '') != (new.get(key) or '')]
+
+
+async def show_update_preview(message, context: ContextTypes.DEFAULT_TYPE, edit=False):
+    ud = context.user_data
+    event, original, event_id = ud['event'], ud['original'], ud['edit_event_id']
+    changed = _changed_fields(original, event)
+    recipients = get_event_recipients(event_id)
+    new_emails = [e for e in get_emails_in_chat(message.chat_id) if e not in recipients]
+    invite_new = ud.get('invite_new') and bool(new_emails)
+
+    lines = []
+    if changed:
+        lines.append(f"Изменения во встрече «{original['name']}»:")
+        for key in changed:
+            lines.append(f"{FIELD_LABELS[key]}: {original[key] or '—'} → {event[key] or '—'}")
+        lines.append('')
+        lines.append('Участники получат обновление, и встреча в их календаре изменится.')
+        try:
+            dt_start, _ = event_datetimes(event)
+            if dt_start < datetime.datetime.now(dt_start.tzinfo):
+                lines.append('⚠️ Новое время уже в прошлом.')
+        except ValueError as e:
+            lines.append(f'⚠️ {e}')
+    else:
+        lines.append(f"Во встрече «{original['name']}» пока нет изменений.")
+    if new_emails:
+        lines.append('')
+        if invite_new:
+            lines.append('Приглашение также получат новые адреса: ' + ', '.join(new_emails))
+        else:
+            lines.append(
+                f'В чате есть новые адреса ({len(new_emails)}), которым эта встреча не отправлялась.'
+            )
+
+    buttons = []
+    if changed or invite_new:
+        buttons.append([InlineKeyboardButton('✅ Отправить обновление', callback_data='upd:send')])
+    buttons.append([InlineKeyboardButton('✏️ Ещё правка', callback_data='upd:more')])
+    if new_emails:
+        label = '➖ Не приглашать новых' if invite_new else f'➕ Пригласить новых ({len(new_emails)})'
+        buttons.append([InlineKeyboardButton(label, callback_data='upd:invite')])
+    buttons.append([InlineKeyboardButton('❌ Отмена', callback_data='upd:cancel')])
+    markup = InlineKeyboardMarkup(buttons)
+    if edit:
+        await _safe_edit_text(message, '\n'.join(lines), reply_markup=markup)
+    else:
+        await message.reply_text('\n'.join(lines), reply_markup=markup)
+    return CONFIRM_UPDATE
+
+
+async def update_event_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    action = (query.data or '').split(':', 1)[1]
+    if not context.user_data.get('edit_event_id'):
+        await _drop_buttons(query)
+        return await _conversation_lost(query.message, context)
+    if action == 'invite':
+        context.user_data['invite_new'] = not context.user_data.get('invite_new')
+        return await show_update_preview(query.message, context, edit=True)
+    await _drop_buttons(query)
+    if action == 'cancel':
+        return await _cancel_editing(query.message, context)
+    if action == 'more':
+        return await _ask_field(query.message, context)
+    if action == 'send':
+        return await _send_update_and_finish(update, context)
+    return CONFIRM_UPDATE
+
+
+async def _send_update_and_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.callback_query.message
+    ud = context.user_data
+    event, event_id = ud['event'], ud['edit_event_id']
+    # Права и статус проверяем ещё раз: встречу могли удалить, пока шло редактирование
+    row, error = await _check_event_access(update, context, event_id)
+    if error:
+        context.user_data.clear()
+        await message.reply_text(error)
+        return ConversationHandler.END
+    try:
+        event_datetimes(event)
+    except ValueError as e:
+        await message.reply_text(f'{e}\nИсправьте дату или время.')
+        return await _ask_field(message, context)
+
+    changed = bool(_changed_fields(row, event))
+    recipients = get_event_recipients(event_id)
+    new_emails = []
+    if ud.get('invite_new'):
+        new_emails = [e for e in get_emails_in_chat(message.chat_id) if e not in recipients]
+    if not changed and not new_emails:
+        await message.reply_text('Изменений нет, отправлять нечего.')
+        return await show_update_preview(message, context)
+
+    sequence = row['sequence'] + 1 if changed else row['sequence']
+    await message.reply_text('Отправляю обновление на email...')
+    sent_upd, err_upd = [], []
+    if changed:
+        sent_upd, err_upd = await _deliver(recipients, event, row['uid'], sequence, 'REQUEST', 'Изменено')
+        if recipients and not sent_upd:
+            # Никто не получил обновление: оставляем встречу как была, чтобы можно было повторить
+            context.user_data.clear()
+            await message.reply_text(
+                'Не удалось отправить обновление, встреча не изменена.\n\n'
+                + _delivery_report([('Обновление получили', sent_upd, err_upd)]),
+                reply_markup=_event_actions_keyboard(event_id),
+            )
+            return ConversationHandler.END
+        update_event(event_id, event, sequence)
+    sent_new, err_new = await _deliver(new_emails, event, row['uid'], sequence, 'REQUEST', 'Приглашение')
+    add_event_recipients(event_id, sent_new)
+
+    report = _delivery_report([
+        ('Обновление получили', sent_upd, err_upd),
+        ('Приглашение получили', sent_new, err_new),
+    ])
+    title = 'Встреча обновлена.' if changed else 'Приглашения отправлены.'
+    await message.reply_text(
+        f'{title}\n\n' + format_event(event) + '\n\n' + report,
+        reply_markup=_event_actions_keyboard(event_id),
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+def _events_list_view(chat_id, page):
+    rows, total = list_upcoming_events(chat_id, page * EVENTS_PAGE_SIZE, EVENTS_PAGE_SIZE)
+    if not rows and page > 0:
+        page = 0
+        rows, total = list_upcoming_events(chat_id, 0, EVENTS_PAGE_SIZE)
+    if not rows:
+        return (
+            'Предстоящих встреч нет.\n'
+            'Встречи, отправленные до появления этой функции, здесь не показываются.',
+            None,
+        )
+    buttons = []
+    for row in rows:
+        start = row['time'].split('-')[0].strip()
+        name = row['name'] if len(row['name']) <= 40 else row['name'][:39] + '…'
+        buttons.append([InlineKeyboardButton(
+            f"{row['date'][:5]} {start} · {name}", callback_data=f"ev:open:{row['id']}"
+        )])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton('◀️', callback_data=f'ev:list:{page - 1}'))
+    if (page + 1) * EVENTS_PAGE_SIZE < total:
+        nav.append(InlineKeyboardButton('▶️', callback_data=f'ev:list:{page + 1}'))
+    if nav:
+        buttons.append(nav)
+    return f'Ближайшие встречи ({total}):', InlineKeyboardMarkup(buttons)
+
+
+async def events_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text, markup = _events_list_view(update.effective_chat.id, 0)
+    await update.message.reply_text(text, reply_markup=markup)
+
+
+async def events_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список встреч, карточка встречи и удаление (без диалога)."""
+    query = update.callback_query
+    _, action, arg = (query.data or '').split(':', 2)
+    arg = int(arg)
+    chat_id = update.effective_chat.id
+
+    if action == 'list':
+        await query.answer()
+        text, markup = _events_list_view(chat_id, arg)
+        await _safe_edit_text(query.message, text, reply_markup=markup)
+        return
+
+    if action == 'open':
+        await query.answer()
+        row = get_event(arg)
+        back = InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ К списку', callback_data='ev:list:0')]])
+        if not row or row['chat_id'] != chat_id or row['status'] != 'active':
+            await _safe_edit_text(query.message, 'Встреча не найдена или удалена.', reply_markup=back)
+            return
+        count = len(get_event_recipients(arg))
+        text = (
+            format_event(row)
+            + f"\n👥 Отправлено: {count} {_ru_plural(count, 'адрес', 'адреса', 'адресов')}"
+        )
+        if row['created_by_name']:
+            text += f" · создал(а) {row['created_by_name']}"
+        if row['starts_at'] < _now_iso():
+            await _safe_edit_text(query.message, text + '\n\nВстреча уже прошла.', reply_markup=back)
+            return
+        await _safe_edit_text(query.message, text, reply_markup=_event_actions_keyboard(arg, back_to_list=True))
+        return
+
+    if action == 'nodel':
+        await query.answer()
+        await _safe_edit_text(query.message, 'Удаление отменено.')
+        return
+
+    if action not in ('del', 'delok'):
+        await query.answer()
+        return
+
+    row, error = await _check_event_access(update, context, arg)
+    if error:
+        await query.answer(error, show_alert=True)
+        if action == 'delok':
+            await _safe_edit_text(query.message, error)
+        return
+    await query.answer()
+    recipients = get_event_recipients(arg)
+
+    if action == 'del':
+        count = len(recipients)
+        await query.message.reply_text(
+            f"Удалить «{row['name']}» {row['date']} {row['time']}?\n"
+            f"Участникам ({count}) придёт отмена, и встреча пропадёт "
+            "или будет зачёркнута в их календарях.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton('🗑 Да, удалить', callback_data=f'ev:delok:{arg}'),
+                InlineKeyboardButton('Не удалять', callback_data=f'ev:nodel:{arg}'),
+            ]]),
+        )
+        return
+
+    # action == 'delok'
+    await _safe_edit_text(query.message, f"Отправляю отмену встречи «{row['name']}»...")
+    sequence = row['sequence'] + 1
+    sent, errors = await _deliver(recipients, row, row['uid'], sequence, 'CANCEL', 'Отменено')
+    if recipients and not sent:
+        await _safe_edit_text(
+            query.message,
+            'Не удалось отправить отмену, встреча не удалена.\n\n'
+            + _delivery_report([('Отмену получили', sent, errors)]),
+            reply_markup=_event_actions_keyboard(arg),
+        )
+        return
+    cancel_event(arg, sequence)
+    await _safe_edit_text(
+        query.message,
+        f"Встреча «{row['name']}» удалена.\n\n"
+        + _delivery_report([('Отмену получили', sent, errors)]),
+    )
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -419,6 +950,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 + '.\nПришлите фото или текст ещё раз с явными данными.'
             )
             return ConversationHandler.END
+        context.user_data.clear()
         context.user_data['event'] = event
         return await show_event_and_confirm(update, context)
     except Exception as e:
@@ -647,22 +1179,16 @@ def _event_timezone() -> ZoneInfo:
         ) from e
 
 
-def create_ics(event, organizer_email, attendee_email):
-    """
-    Создаёт строку .ics для календарного события с поддержкой RSVP (ответа на приглашение)
-    event: dict с ключами name, date, time, location
-    organizer_email: email организатора
-    attendee_email: email приглашённого
-    """
-    date = event['date']
-    time = event['time']
+def event_datetimes(event):
+    """Начало и конец события (aware datetime в EVENT_TIMEZONE)."""
     tz = _event_timezone()
+    date = (event.get('date') or '').strip()
+    time = (event.get('time') or '').strip()
     try:
         if '-' in time:
-            start_time, end_time = [t.strip() for t in time.split('-')]
+            start_time, end_time = [t.strip() for t in time.split('-', 1)]
         else:
-            start_time = time.strip()
-            end_time = start_time
+            start_time = end_time = time
         dt_start = datetime.datetime.strptime(
             date + ' ' + start_time, '%d.%m.%Y %H:%M'
         ).replace(tzinfo=tz)
@@ -671,47 +1197,103 @@ def create_ics(event, organizer_email, attendee_email):
         ).replace(tzinfo=tz)
     except Exception as e:
         raise ValueError(f"Ошибка разбора даты/времени: {e}. Проверьте формат даты (ДД.ММ.ГГГГ) и времени (ЧЧ:ММ или ЧЧ:ММ-ЧЧ:ММ).")
-    dtstamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
-    dtstart = dt_start.strftime('%Y%m%dT%H%M%S')
-    dtend = dt_end.strftime('%Y%m%dT%H%M%S')
-    tzid = config.EVENT_TIMEZONE
-    uid = str(uuid.uuid4())
-    description = f"Приглашение на событие. Комментарий: {event.get('comment', '')}\nПожалуйста, выберите ответ: Пойду/Не пойду"
-    ics = f"""BEGIN:VCALENDAR
-VERSION:2.0
-PRODID:-//AddCalendarBot//EN
-METHOD:REQUEST
-BEGIN:VEVENT
-UID:{uid}
-DTSTAMP:{dtstamp}
-DTSTART;TZID={tzid}:{dtstart}
-DTEND;TZID={tzid}:{dtend}
-SUMMARY:{event['name']}
-LOCATION:{event['location']}
-DESCRIPTION:{description}
-ORGANIZER;CN=Организатор:MAILTO:{organizer_email}
-ATTENDEE;CN=Гость;RSVP=TRUE;PARTSTAT=NEEDS-ACTION:MAILTO:{attendee_email}
-SEQUENCE:0
-STATUS:CONFIRMED
-TRANSP:OPAQUE
-END:VEVENT
-END:VCALENDAR"""
-    return ics
+    if dt_end < dt_start:
+        # Например, 23:00-01:00 — конец на следующий день
+        dt_end += datetime.timedelta(days=1)
+    return dt_start, dt_end
 
-def send_email(to_email, event):
+
+def _ics_escape(value) -> str:
+    return (
+        str(value or '')
+        .replace('\\', '\\\\')
+        .replace(';', '\\;')
+        .replace(',', '\\,')
+        .replace('\r\n', '\\n')
+        .replace('\r', '\\n')
+        .replace('\n', '\\n')
+    )
+
+
+def _ics_fold(line: str) -> str:
+    """RFC 5545: строки длиннее 75 октетов переносятся, не разрывая UTF-8 символы."""
+    chunks, current, size = [], '', 0
+    for ch in line:
+        n = len(ch.encode('utf-8'))
+        if size + n > 75:
+            chunks.append(current)
+            current, size = ' ', 1
+        current += ch
+        size += n
+    chunks.append(current)
+    return '\r\n'.join(chunks)
+
+
+def create_ics(event, organizer_email, attendee_email, uid, sequence=0, method='REQUEST'):
+    """
+    Создаёт .ics для календарного события.
+    method=REQUEST — приглашение или обновление (тот же uid, больший sequence),
+    method=CANCEL — отмена встречи.
+    """
+    dt_start, dt_end = event_datetimes(event)
+    dtstamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    tzid = config.EVENT_TIMEZONE
+    comment = (event.get('comment') or '').strip()
+    if method == 'CANCEL':
+        description = 'Встреча отменена организатором.'
+        status = 'CANCELLED'
+        attendee = f'ATTENDEE;CN=Гость:MAILTO:{attendee_email}'
+    else:
+        description = (
+            f"Приглашение на событие. Комментарий: {comment}\n"
+            "Пожалуйста, выберите ответ: Пойду/Не пойду"
+        )
+        status = 'CONFIRMED'
+        attendee = f'ATTENDEE;CN=Гость;RSVP=TRUE;PARTSTAT=NEEDS-ACTION:MAILTO:{attendee_email}'
+    lines = [
+        'BEGIN:VCALENDAR',
+        'VERSION:2.0',
+        'PRODID:-//AddCalendarBot//EN',
+        f'METHOD:{method}',
+        'BEGIN:VEVENT',
+        f'UID:{uid}',
+        f'DTSTAMP:{dtstamp}',
+        f"DTSTART;TZID={tzid}:{dt_start.strftime('%Y%m%dT%H%M%S')}",
+        f"DTEND;TZID={tzid}:{dt_end.strftime('%Y%m%dT%H%M%S')}",
+        f"SUMMARY:{_ics_escape(event['name'])}",
+        f"LOCATION:{_ics_escape(event['location'])}",
+        f'DESCRIPTION:{_ics_escape(description)}',
+        f'ORGANIZER;CN=Организатор:MAILTO:{organizer_email}',
+        attendee,
+        f'SEQUENCE:{sequence}',
+        f'STATUS:{status}',
+        'TRANSP:OPAQUE',
+        'END:VEVENT',
+        'END:VCALENDAR',
+    ]
+    return '\r\n'.join(_ics_fold(line) for line in lines) + '\r\n'
+
+
+def send_email(to_email, event, uid, sequence=0, method='REQUEST', subject_prefix='Приглашение'):
     logger.info(f"Connecting to SMTP server {config.SMTP_SERVER}:{config.SMTP_PORT} as {config.EMAIL_LOGIN}")
     try:
-        ics_content = create_ics(event, config.EMAIL_LOGIN, to_email)
+        ics_content = create_ics(event, config.EMAIL_LOGIN, to_email, uid, sequence, method)
     except ValueError as e:
         logger.error(f'Ошибка создания .ics: {e}')
         return str(e)  # Вернуть ошибку для пользователя
-    msg = MIMEText(ics_content, 'calendar', 'utf-8')
-    msg['Subject'] = f"Приглашение: {event['name']}"
+    if method == 'CANCEL':
+        plain = 'Встреча отменена.\n\n' + format_event(event)
+    else:
+        plain = format_event(event)
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = f"{subject_prefix}: {event['name']}"
     msg['From'] = config.EMAIL_LOGIN
     msg['To'] = to_email
     msg.add_header('Content-class', 'urn:content-classes:calendarmessage')
-    msg.add_header('Content-Disposition', 'inline; filename="invite.ics"')
-    msg.add_header('Content-Type', 'text/calendar; method=REQUEST; charset="UTF-8"')
+    msg.attach(MIMEText(plain, 'plain', 'utf-8'))
+    calendar_part = MIMEText(ics_content, 'calendar', 'utf-8')
+    calendar_part.set_param('method', method)
+    msg.attach(calendar_part)
     try:
         with smtplib.SMTP_SSL(config.SMTP_SERVER, config.SMTP_PORT) as server:
             server.login(config.EMAIL_LOGIN, config.EMAIL_PASSWORD)
@@ -792,10 +1374,16 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/remove_email <email> — удалить email из списка (в группах — только админы)\n"
         "/clear_emails — очистить весь список email (в группах — только админы)\n"
         "/emails — показать список email\n"
+        "/events — ближайшие встречи: изменить или удалить\n"
         "/menu и /help — это меню\n"
         "/cancel — отменить подтверждение события или редактирование\n"
         "\n"
-        "Вы также можете отправить текстовое сообщение или фотографию с текстом события — бот распознает параметры и отправит приглашение на email."
+        "Вы также можете отправить текстовое сообщение или фотографию с текстом события — бот распознает параметры и отправит приглашение на email.\n"
+        "\n"
+        "Изменить или удалить встречу можно кнопками под отчётом о рассылке или через /events. "
+        "Участники получат обновление или отмену, и встреча изменится в их календаре. "
+        "В группах это могут делать автор встречи и админы чата. "
+        "Встречи, отправленные до появления этой функции, изменить нельзя."
     )
     await update.message.reply_text(menu_text)
 
@@ -812,13 +1400,14 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
-def main():
-    application = Application.builder().token(config.TELEGRAM_TOKEN).build()
+def build_application(builder=None) -> Application:
+    application = (builder or Application.builder().token(config.TELEGRAM_TOKEN)).build()
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler('start', start),
             MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text),
-            MessageHandler(filters.PHOTO, handle_photo)
+            MessageHandler(filters.PHOTO, handle_photo),
+            CallbackQueryHandler(edit_event_entry, pattern=r'^ev:edit:\d+$'),
         ],
         states={
             EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_email)],
@@ -826,26 +1415,37 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_event),
                 CallbackQueryHandler(confirm_event_callback, pattern='^event_'),
             ],
-            CHOOSE_FIELD: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_field)],
-            EDIT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_field)],
-            EDIT_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_field)],
-            EDIT_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_field)],
-            EDIT_LOCATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_field)],
-            EDIT_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_field)],
+            CHOOSE_FIELD: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_field),
+                CallbackQueryHandler(edit_field_callback, pattern='^field:'),
+            ],
+            EDIT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_field)],
+            CONFIRM_UPDATE: [CallbackQueryHandler(update_event_callback, pattern='^upd:')],
         },
         fallbacks=[
             CommandHandler('cancel', cancel),
             CommandHandler('help', help_in_conversation),
             CommandHandler('menu', help_in_conversation),
+            # «Изменить» у другой встречи посреди диалога начинает её редактирование
+            CallbackQueryHandler(edit_event_entry, pattern=r'^ev:edit:\d+$'),
         ],
     )
     application.add_handler(conv_handler)
+    application.add_handler(
+        CallbackQueryHandler(events_callback, pattern=r'^ev:(list|open|del|delok|nodel):\d+$')
+    )
+    application.add_handler(CommandHandler('events', events_command))
     application.add_handler(CommandHandler('help', menu_command))
     application.add_handler(CommandHandler('emails', emails_command))
     application.add_handler(CommandHandler('clear_emails', clear_emails_command))
     application.add_handler(CommandHandler('remove_email', remove_email_command))
     application.add_handler(CommandHandler('add_email', add_email_command))
     application.add_handler(CommandHandler('menu', menu_command))
+    return application
+
+
+def main():
+    application = build_application()
     # Иначе inline-кнопки не получают callback_query (см. PTB: allowed_updates).
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
